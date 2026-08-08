@@ -75,7 +75,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--budgets", default="512,1024,2048,4096")
     p.add_argument("--samples-per-dataset", type=int, default=40)
     p.add_argument("--max-context", type=int, default=32768)
-    p.add_argument("--group-size", type=int, default=32)
+    p.add_argument("--group-size", type=int, default=32,
+                   help="token-axis magnitude-threshold group size (fixed at 32)")
+    p.add_argument("--dim-group-size", type=int, choices=(16, 32, 64), default=32,
+                   help="dimensions sharing PopKV low/delta representatives")
     p.add_argument("--quest-page-size", type=int, default=16)
     p.add_argument("--full-layers", default="0,1")
     p.add_argument("--seed", type=int, default=42)
@@ -232,15 +235,22 @@ def load_samples(tokenizer: Any, args: argparse.Namespace, datasets: tuple[str, 
     return selected
 
 
-def method_specs(methods: tuple[str, ...], budgets: tuple[int, ...], group: int, page: int) -> list[MethodSpec]:
+def method_specs(
+    methods: tuple[str, ...], budgets: tuple[int, ...], group: int, dim_group: int, page: int,
+) -> list[MethodSpec]:
     result: list[MethodSpec] = []
     for method in methods:
         if method == "full":
             result.append(MethodSpec("full", "full", None))
         else:
             for budget in budgets:
-                label = (f"quest_p{page}_b{budget}" if method == "quest" else
-                         f"{method}_g{group}_b{budget}")
+                if method == "quest":
+                    label = f"quest_p{page}_b{budget}"
+                elif method == "popkv" and dim_group != 32:
+                    label = f"popkv_tg{group}_dg{dim_group}_b{budget}"
+                else:
+                    # Preserve existing G32/FIER labels for resumable outputs.
+                    label = f"{method}_g{group}_b{budget}"
                 result.append(MethodSpec(method, label, budget))
     return result
 
@@ -250,6 +260,7 @@ def retrieval_for(args: argparse.Namespace, spec: MethodSpec) -> RetrievalConfig
         budget=spec.budget or max(int_tuple(args.budgets)),
         quest_page_size=args.quest_page_size,
         group_size=args.group_size,
+        dim_group_size=args.dim_group_size,
         full_layers=int_tuple(args.full_layers),
     )
 
@@ -511,7 +522,7 @@ def main() -> None:
     unknown_datasets = set(datasets) - set(PROMPTS)
     if unknown_methods or unknown_datasets or not budgets:
         raise SystemExit(f"invalid methods={unknown_methods} datasets={unknown_datasets} budgets={budgets}")
-    specs = method_specs(methods, budgets, args.group_size, args.quest_page_size)
+    specs = method_specs(methods, budgets, args.group_size, args.dim_group_size, args.quest_page_size)
     output_dir = Path(args.output_dir)
     config = vars(args) | {
         "resolved_methods": [asdict(x) for x in specs], "resolved_datasets": datasets,

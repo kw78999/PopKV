@@ -15,21 +15,27 @@ import torch
 import torch.nn.functional as F
 
 METHODS = ("full", "quest", "fier", "popkv")
+TOKEN_GROUP_SIZE = 32
+PACKING_WORD_BITS = 32
+SUPPORTED_DIM_GROUP_SIZES = (16, 32, 64)
 T = TypeVar("T")
 
 
 @dataclass(frozen=True)
 class RetrievalConfig:
     budget: int = 4096
-    group_size: int = 32
+    group_size: int = 32  # token-axis magnitude-threshold group (B_token)
+    dim_group_size: int = 32  # dimensions sharing low/delta representatives (G_dim)
     quest_page_size: int = 16
     full_layers: tuple[int, ...] = (0, 1)
 
     def validate(self) -> None:
         if self.budget <= 1:
             raise ValueError("budget must reserve at least one retrieved and one current token")
-        if self.group_size != 32:
-            raise ValueError("the released Pop-KV/FIER kernels use group_size=32")
+        if self.group_size != TOKEN_GROUP_SIZE:
+            raise ValueError("token-axis group_size is fixed at 32")
+        if self.dim_group_size not in SUPPORTED_DIM_GROUP_SIZES:
+            raise ValueError("dim_group_size must be one of 16, 32, 64")
         if self.quest_page_size <= 0:
             raise ValueError("quest_page_size must be positive")
 
@@ -58,6 +64,7 @@ class FIERCache:
 @dataclass
 class PopKVCache:
     group_size: int
+    dim_group_size: int
     token_count: int
     sealed_tokens: int
     packed: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -252,17 +259,21 @@ def append_fier(cache: FIERCache, keys: torch.Tensor) -> None:
 
 # ---- Pop-KV ----------------------------------------------------------------
 
-def build_popkv_cache(keys: torch.Tensor, *, group_size: int, reserve_tokens: int) -> PopKVCache:
+def build_popkv_cache(
+    keys: torch.Tensor, *, group_size: int, dim_group_size: int = 32, reserve_tokens: int,
+) -> PopKVCache:
     from popkv_cuda import pack_keys
 
     if group_size != 32:
-        raise ValueError("Pop-KV release kernel requires group_size=32")
+        raise ValueError("Pop-KV token-axis group size is fixed at 32")
+    if dim_group_size not in (16, 32, 64):
+        raise ValueError("dim_group_size must be one of 16, 32, 64")
     tokens = int(keys.shape[1])
     capacity = math.ceil((tokens + reserve_tokens) / group_size) * group_size
-    packed = pack_keys(keys.contiguous(), token_capacity=capacity)
+    packed = pack_keys(keys.contiguous(), token_capacity=capacity, dim_group_size=dim_group_size)
     sealed = (tokens // group_size) * group_size
     return PopKVCache(
-        group_size, tokens, sealed, packed,
+        group_size, dim_group_size, tokens, sealed, packed,
         keys[:, sealed:].detach().clone().contiguous(),
     )
 
@@ -273,14 +284,154 @@ def append_popkv(cache: PopKVCache, keys: torch.Tensor) -> None:
     cache.active_keys = torch.cat([cache.active_keys, keys.detach()], dim=1).contiguous()
     if cache.sealed_tokens + int(cache.active_keys.shape[1]) > int(cache.packed[0].shape[1]):
         raise RuntimeError("Pop-KV cache reserve exhausted")
-    pack_keys_into(cache.active_keys, cache.packed, token_offset=cache.sealed_tokens)
+    pack_keys_into(
+        cache.active_keys, cache.packed, token_offset=cache.sealed_tokens,
+        dim_group_size=cache.dim_group_size,
+    )
     cache.token_count += 1
     if int(cache.active_keys.shape[1]) == cache.group_size:
         cache.sealed_tokens += cache.group_size
         cache.active_keys = cache.active_keys[:, :0].contiguous()
 
 
-def popkv_reference_scores(
+def _reference_pack_bits(bits: torch.Tensor) -> torch.Tensor:
+    """Pack a boolean final dimension into fixed-width uint32 bitplanes."""
+    words = math.ceil(bits.shape[-1] / 32)
+    packed = torch.zeros((*bits.shape[:-1], words), device=bits.device, dtype=torch.int32)
+    for word in range(words):
+        start, end = word * 32, min((word + 1) * 32, bits.shape[-1])
+        lanes = torch.arange(end - start, device=bits.device, dtype=torch.int64)
+        weights = torch.bitwise_left_shift(torch.ones_like(lanes), lanes)
+        packed[..., word] = (bits[..., start:end].to(torch.int64) * weights).sum(-1).to(torch.int32)
+    return packed
+
+
+def _reference_representatives(
+    values: torch.Tensor, magnitude: torch.Tensor, dim_group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    groups = math.ceil(values.shape[-1] / dim_group_size)
+    # Preserve the release G32 reduction shape/order exactly for regression tests.
+    if dim_group_size == 32:
+        pad = groups * 32 - values.shape[-1]
+        absolute, mag, valid = values.abs(), magnitude, torch.ones_like(magnitude)
+        if pad:
+            shape = (*values.shape[:-1], pad)
+            absolute = torch.cat([absolute, torch.zeros(shape, device=values.device)], -1)
+            mag = torch.cat([mag, torch.zeros(shape, dtype=torch.bool, device=values.device)], -1)
+            valid = torch.cat([valid, torch.zeros(shape, dtype=torch.bool, device=values.device)], -1)
+        shape = (*values.shape[:-1], groups, 32)
+        absolute, mag, valid = absolute.view(shape), mag.view(shape), valid.view(shape)
+        low_mask, high_mask = (~mag) & valid, mag & valid
+        low_count, high_count = low_mask.sum(-1), high_mask.sum(-1)
+        low = (absolute * low_mask).sum(-1) / low_count.clamp_min(1)
+        high = (absolute * high_mask).sum(-1) / high_count.clamp_min(1)
+        low = torch.where(low_count > 0, low, high)
+        high = torch.where(high_count > 0, high, low)
+        return low, high - low
+    low_out, delta_out = [], []
+    for group in range(groups):
+        start, end = group * dim_group_size, min((group + 1) * dim_group_size, values.shape[-1])
+        absolute = values[..., start:end].abs()
+        mag = magnitude[..., start:end]
+        low_mask, high_mask = ~mag, mag
+        low_count, high_count = low_mask.sum(-1), high_mask.sum(-1)
+        low_sum = (absolute * low_mask).sum(-1)
+        high_sum = (absolute * high_mask).sum(-1)
+        low = torch.where(
+            low_count > 0, low_sum / low_count.clamp_min(1),
+            torch.where(high_count > 0, high_sum / high_count.clamp_min(1), torch.zeros_like(low_sum)),
+        )
+        high = torch.where(high_count > 0, high_sum / high_count.clamp_min(1), low)
+        low_out.append(low); delta_out.append(high - low)
+    return torch.stack(low_out, -1), torch.stack(delta_out, -1)
+
+
+def reference_query_encode(
+    queries: torch.Tensor, dim_group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Readable reference separating 32-bit packing from representative groups.
+
+    Sign/magnitude have ceil(D/32) words while low/delta have ceil(D/G_dim)
+    groups. Query magnitude thresholds continue to use the whole query head.
+    """
+    if queries.ndim != 3:
+        raise ValueError("queries must be [batch, query heads, head dim]")
+    if queries.shape[-1] <= 0:
+        raise ValueError("query head dimension must be non-empty")
+
+    if dim_group_size not in (16, 32, 64):
+        raise ValueError("dim_group_size must be one of 16, 32, 64")
+    q = queries.float()
+    minimum = q.amin(dim=-1, keepdim=True)
+    maximum = q.amax(dim=-1, keepdim=True)
+    sign = q >= 0
+    magnitude = torch.where(sign, q > maximum * 0.5, q < minimum * 0.5)
+
+    low, delta = _reference_representatives(q, magnitude, dim_group_size)
+    return _reference_pack_bits(sign), _reference_pack_bits(magnitude), low, delta
+
+
+def reference_query_encode_g32(
+    queries: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward-compatible wrapper for the release G_dim=32 reference."""
+    return reference_query_encode(queries, 32)
+
+
+def _reference_query_encode_g32_legacy(
+    queries: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Frozen release-semantics oracle used only by G32 regression tests."""
+    q = queries.float()
+    qmin, qmax = q.amin(-1, keepdim=True), q.amax(-1, keepdim=True)
+    sign = q >= 0
+    magnitude = torch.where(sign, q > qmax * 0.5, q < qmin * 0.5)
+    words = math.ceil(q.shape[-1] / 32)
+    pad = words * 32 - q.shape[-1]
+    absolute, valid, mag = q.abs(), torch.ones_like(magnitude), magnitude
+    if pad:
+        shape = (*q.shape[:-1], pad)
+        absolute = torch.cat([absolute, torch.zeros(shape, device=q.device)], -1)
+        valid = torch.cat([valid, torch.zeros(shape, dtype=torch.bool, device=q.device)], -1)
+        mag = torch.cat([mag, torch.zeros(shape, dtype=torch.bool, device=q.device)], -1)
+    shape = (*q.shape[:-1], words, 32)
+    absolute, valid, mag = absolute.view(shape), valid.view(shape), mag.view(shape)
+    low_mask, high_mask = (~mag) & valid, mag & valid
+    low_count, high_count = low_mask.sum(-1), high_mask.sum(-1)
+    low = (absolute * low_mask).sum(-1) / low_count.clamp_min(1)
+    high = (absolute * high_mask).sum(-1) / high_count.clamp_min(1)
+    low = torch.where(low_count > 0, low, high)
+    high = torch.where(high_count > 0, high, low)
+    return _reference_pack_bits(sign), _reference_pack_bits(magnitude), low, high - low
+
+
+def reference_key_encode(
+    keys: torch.Tensor, *, dim_group_size: int = 32, token_group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference key encoder with fixed uint32 packing and explicit axis groups."""
+    if keys.ndim != 3 or keys.shape[-1] <= 0 or keys.shape[-2] <= 0:
+        raise ValueError("keys must be [KV heads, tokens, non-empty head dim]")
+    if token_group_size != 32:
+        raise ValueError("token_group_size is fixed at 32")
+    if dim_group_size not in (16, 32, 64):
+        raise ValueError("dim_group_size must be one of 16, 32, 64")
+    k = keys.float()
+    kv_heads, tokens, dim = k.shape
+    token_groups = math.ceil(tokens / token_group_size)
+    padded = token_groups * token_group_size - tokens
+    extrema = F.pad(k, (0, 0, 0, padded), value=float("nan")) if padded else k
+    grouped = extrema.view(kv_heads, token_groups, token_group_size, dim)
+    minimum = torch.nan_to_num(grouped, nan=float("inf")).amin(2)
+    maximum = torch.nan_to_num(grouped, nan=-float("inf")).amax(2)
+    group_ids = torch.arange(tokens, device=k.device) // token_group_size
+    minimum, maximum = minimum[:, group_ids], maximum[:, group_ids]
+    sign = k >= 0
+    magnitude = torch.where(sign, k > maximum * 0.5, k < minimum * 0.5)
+    low, delta = _reference_representatives(k, magnitude, dim_group_size)
+    return _reference_pack_bits(sign), _reference_pack_bits(magnitude), low, delta
+
+
+def _popkv_reference_scores_g32_legacy(
     queries: torch.Tensor, keys: torch.Tensor, *, head_to_kv: torch.Tensor, group_size: int = 32,
 ) -> torch.Tensor:
     """Readable reference for the final Pop-KV score used by correctness tests."""
@@ -334,6 +485,89 @@ def popkv_reference_scores(
     mapped_mag = kmag.index_select(0, head_to_kv)
     khat = torch.where(mapped_sign, 1.0, -1.0) * torch.where(mapped_mag, kh, kl)
     return torch.einsum("bhd,htd->bht", qhat, khat) / math.sqrt(dim)
+
+
+def popkv_reference_scores(
+    queries: torch.Tensor, keys: torch.Tensor, *, head_to_kv: torch.Tensor,
+    group_size: int = 32, dim_group_size: int = 32,
+) -> torch.Tensor:
+    """Readable reconstructed PopKV score for G_dim in {16, 32, 64}."""
+    q = queries.float(); k = keys.float(); dim = int(q.shape[-1])
+    q_sign_bits, q_mag_bits, q_low, q_delta = reference_query_encode(q, dim_group_size)
+    k_sign_bits, k_mag_bits, k_low, k_delta = reference_key_encode(
+        k, dim_group_size=dim_group_size, token_group_size=group_size,
+    )
+    del q_sign_bits, q_mag_bits, k_sign_bits, k_mag_bits  # packed layouts are tested separately
+    qmin, qmax = q.amin(-1, keepdim=True), q.amax(-1, keepdim=True)
+    qsign = q >= 0
+    qmag = torch.where(qsign, q > qmax * .5, q < qmin * .5)
+    token_groups = math.ceil(k.shape[1] / group_size)
+    padded = token_groups * group_size - k.shape[1]
+    extrema = F.pad(k, (0, 0, 0, padded), value=float("nan")) if padded else k
+    grouped = extrema.view(k.shape[0], token_groups, group_size, dim)
+    minimum = torch.nan_to_num(grouped, nan=float("inf")).amin(2)
+    maximum = torch.nan_to_num(grouped, nan=-float("inf")).amax(2)
+    group_ids = torch.arange(k.shape[1], device=k.device) // group_size
+    minimum, maximum = minimum[:, group_ids], maximum[:, group_ids]
+    ksign = k >= 0
+    kmag = torch.where(ksign, k > maximum * .5, k < minimum * .5)
+    ql = q_low.repeat_interleave(dim_group_size, -1)[..., :dim]
+    qh = (q_low + q_delta).repeat_interleave(dim_group_size, -1)[..., :dim]
+    klow = k_low.index_select(0, head_to_kv)
+    kdelta = k_delta.index_select(0, head_to_kv)
+    kl = klow.repeat_interleave(dim_group_size, -1)[..., :dim]
+    kh = (klow + kdelta).repeat_interleave(dim_group_size, -1)[..., :dim]
+    qhat = torch.where(qsign, 1.0, -1.0) * torch.where(qmag, qh, ql)
+    mapped_sign = ksign.index_select(0, head_to_kv)
+    mapped_mag = kmag.index_select(0, head_to_kv)
+    khat = torch.where(mapped_sign, 1.0, -1.0) * torch.where(mapped_mag, kh, kl)
+    return torch.einsum("bhd,htd->bht", qhat, khat) / math.sqrt(dim)
+
+
+def popkv_reference_bitwise_scores(
+    queries: torch.Tensor, keys: torch.Tensor, *, head_to_kv: torch.Tensor,
+    group_size: int = 32, dim_group_size: int = 32,
+) -> torch.Tensor:
+    """Slow CPU-oriented popcount decomposition used to test G_dim semantics."""
+    q_sign, q_mag, q_low, q_delta = reference_query_encode(queries, dim_group_size)
+    k_sign, k_mag, k_low, k_delta = reference_key_encode(
+        keys, dim_group_size=dim_group_size, token_group_size=group_size,
+    )
+    batch, q_heads, dim = queries.shape
+    tokens = keys.shape[1]
+    rep_groups = math.ceil(dim / dim_group_size)
+    output = torch.empty((batch, q_heads, tokens), dtype=torch.float32, device=queries.device)
+    full_word = (1 << 32) - 1
+    for b in range(batch):
+        for qh in range(q_heads):
+            kvh = int(head_to_kv[qh])
+            for token in range(tokens):
+                total = 0.0
+                for rep in range(rep_groups):
+                    start = rep * dim_group_size
+                    end = min(start + dim_group_size, dim)
+                    counts = [0, 0, 0, 0]
+                    for word in range(start // 32, (end - 1) // 32 + 1):
+                        word_start = word * 32
+                        begin = max(start, word_start) - word_start
+                        finish = min(end, word_start + 32) - word_start
+                        width = finish - begin
+                        mask = (full_word if width == 32 else (1 << width) - 1) << begin
+                        qs = int(q_sign[b, qh, word]) & full_word
+                        qm = int(q_mag[b, qh, word]) & mask
+                        ks = int(k_sign[kvh, token, word]) & full_word
+                        km = int(k_mag[kvh, token, word]) & mask
+                        agreement = (~(qs ^ ks)) & mask
+                        both = qm & km
+                        selections = (mask, qm, km, both)
+                        for index, selection in enumerate(selections):
+                            counts[index] += 2 * (agreement & selection).bit_count() - selection.bit_count()
+                    ql, dq = float(q_low[b, qh, rep]), float(q_delta[b, qh, rep])
+                    kl, dk = float(k_low[kvh, token, rep]), float(k_delta[kvh, token, rep])
+                    total += (ql * kl * counts[0] + dq * kl * counts[1] +
+                              ql * dk * counts[2] + dq * dk * counts[3])
+                output[b, qh, token] = total / math.sqrt(dim)
+    return output
 
 
 # ---- Shared attention and model adapter ------------------------------------
@@ -458,7 +692,8 @@ class LlamaSparseDecoder:
                 )
             else:
                 layers[layer] = build_popkv_cache(
-                    keys, group_size=self.retrieval.group_size, reserve_tokens=reserve_tokens,
+                    keys, group_size=self.retrieval.group_size,
+                    dim_group_size=self.retrieval.dim_group_size, reserve_tokens=reserve_tokens,
                 )
         return RetrievalCaches(method, layers)
 
@@ -589,6 +824,7 @@ class LlamaSparseDecoder:
                         lambda: score_popkv(
                             q[0, :, 0].unsqueeze(0).contiguous(), sparse_cache.packed,
                             head_to_kv=self.head_to_kv, tokens=sparse_cache.token_count,
+                            dim_group_size=sparse_cache.dim_group_size,
                         ), q.device, score_events,
                     ); diag.candidate_score_ms += ms
                     def topk_popkv():
