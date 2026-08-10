@@ -715,7 +715,7 @@ class LlamaSparseDecoder:
             keys, values = _layer_cache(prefix_cache, layer)
             key_store = torch.empty((*keys.shape[:-2], capacity, keys.shape[-1]), device=keys.device, dtype=keys.dtype)
             value_store = torch.empty_like(key_store)
-            key_store[..., :length].copy_(keys); value_store[..., :length].copy_(values)
+            key_store[..., :length, :].copy_(keys); value_store[..., :length, :].copy_(values)
             keys_out.append(key_store); values_out.append(value_store)
         return StaticKVCache(keys_out, values_out, length, capacity)
 
