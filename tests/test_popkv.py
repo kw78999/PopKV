@@ -6,16 +6,44 @@ import unittest
 import torch
 
 from popkv import (
-    METHODS, RetrievalConfig, append_quest, build_quest_cache,
+    METHODS, RetrievalConfig, append_quest, build_quest_cache, append_fier, build_fier_cache,
     _popkv_reference_scores_g32_legacy, _reference_query_encode_g32_legacy,
     popkv_reference_bitwise_scores, popkv_reference_scores, quest_indices, quest_scores,
     reference_key_encode, reference_query_encode, reference_query_encode_g32,
+    DecodeDiagnostics, _DecodeStageTimer, _DECODE_STAGE_FIELDS, _append_current,
+    _sparse_layer_indices,
 )
 
 
 class PopKVTests(unittest.TestCase):
+    def test_exhaustive_stage_timer_closes_to_total(self) -> None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        timer = _DecodeStageTimer(device)
+        for name in _DECODE_STAGE_FIELDS:
+            if device.type == "cuda": torch.ones(32, device=device).add_(1)
+            else: sum(range(32))
+            timer.mark(name)
+        diagnostics = DecodeDiagnostics(); timer.finish(diagnostics)
+        self.assertAlmostEqual(
+            diagnostics.gpu_component_sum_ms + diagnostics.gpu_unattributed_ms,
+            diagnostics.gpu_decode_ms, places=5,
+        )
+        self.assertAlmostEqual(
+            diagnostics.candidate_search_ms,
+            diagnostics.retrieval_stage_ms + diagnostics.candidate_score_ms +
+            diagnostics.candidate_topk_ms, places=7,
+        )
+
     def test_public_methods_are_only_paper_methods(self) -> None:
         self.assertEqual(METHODS, ("full", "quest", "fier", "popkv"))
+
+    def test_sparse_methods_skip_configured_full_layers(self) -> None:
+        self.assertEqual(_sparse_layer_indices(4, (0, 1)), (2, 3))
+
+    def test_current_token_is_always_reserved(self) -> None:
+        selected = torch.tensor([[4, 7], [2, 9]])
+        actual = _append_current(selected, 12)
+        self.assertTrue(torch.equal(actual[:, -1], torch.tensor([11, 11])))
 
     def test_release_configuration_is_explicit(self) -> None:
         RetrievalConfig().validate()
@@ -34,19 +62,49 @@ class PopKVTests(unittest.TestCase):
         for _ in range(4):
             queries = torch.randn(32, 16, dtype=torch.bfloat16)
             current = torch.randn(8, 16, dtype=torch.bfloat16)
-            cached = quest_scores(queries, cache, current, mapping)
-            all_keys = torch.cat([keys, current[:, None]], dim=1).float()
+            cached = quest_scores(queries, cache, mapping)
+            all_keys = keys.float()
             pad = (-all_keys.shape[1]) % 8
             if pad:
                 all_keys = torch.cat([all_keys, all_keys[:, -1:].expand(8, pad, 16)], dim=1)
-            pages = all_keys.view(8, math.ceil(all_keys.shape[1] / 8), 8, 16)
+            pages = all_keys.view(8, math.ceil(keys.shape[1] / 8), 8, 16)
             mins, maxs = pages.amin(2).index_select(0, mapping), pages.amax(2).index_select(0, mapping)
             direct = torch.maximum(queries.float()[:, None] * mins, queries.float()[:, None] * maxs).sum(-1)
             self.assertTrue(torch.equal(cached, direct))
             left = quest_indices(cached, num_tokens=keys.shape[1] + 1, page_size=8, budget=16)
             right = quest_indices(direct, num_tokens=keys.shape[1] + 1, page_size=8, budget=16)
             self.assertTrue(torch.equal(left[0], right[0]) and torch.equal(left[1], right[1]))
+            self.assertTrue((left[0].eq(keys.shape[1]) & left[1]).any(dim=-1).all())
             append_quest(cache, current[:, None]); keys = torch.cat([keys, current[:, None]], 1)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_quest_cuda_update_matches_direct_active_page_bounds(self) -> None:
+        torch.manual_seed(5)
+        keys = torch.randn(2, 15, 64, device="cuda", dtype=torch.bfloat16)
+        cache = build_quest_cache(keys, page_size=8, reserve_tokens=4)
+        for _ in range(3):
+            current = torch.randn(2, 1, 64, device="cuda", dtype=torch.bfloat16)
+            append_quest(cache, current); keys = torch.cat([keys, current], dim=1)
+            page = (keys.shape[1] - 1) // 8
+            expected = keys[:, page * 8:].float()
+            torch.testing.assert_close(cache.page_min[:, page], expected.amin(dim=1), atol=0, rtol=0)
+            torch.testing.assert_close(cache.page_max[:, page], expected.amax(dim=1), atol=0, rtol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_fier_post_update_keeps_active_group_searchable(self) -> None:
+        from fier_triton import score_packed_batched, score_tensors
+        torch.manual_seed(7)
+        keys = torch.randn(2, 31, 64, device="cuda", dtype=torch.bfloat16)
+        mapping = torch.arange(8, device="cuda") // 4
+        cache = build_fier_cache(keys, group_size=32, reserve_tokens=4)
+        for _ in range(3):
+            current = torch.randn(2, 1, 64, device="cuda", dtype=torch.bfloat16)
+            append_fier(cache, current); keys = torch.cat([keys, current], dim=1)
+            query = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
+            cached = score_packed_batched(query, cache.packed, cache.group_min, cache.group_max,
+                mapping, tokens=keys.shape[1], group_size=32)
+            direct = score_tensors(query, keys.contiguous(), head_to_kv=mapping, group_size=32)
+            torch.testing.assert_close(cached, direct, atol=0, rtol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_popkv_cuda_matches_readable_reference(self) -> None:

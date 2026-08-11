@@ -31,6 +31,52 @@ __device__ inline float load_as_float<c10::BFloat16>(const c10::BFloat16* ptr, i
 }
 
 template <typename scalar_t>
+__global__ void quest_update_kernel(
+    const scalar_t* __restrict__ keys, float* __restrict__ page_min,
+    float* __restrict__ page_max, int64_t tokens, int64_t head_dim,
+    int64_t capacity_pages, int64_t page) {
+    int64_t kvh = blockIdx.x;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float lo = load_as_float(keys, (kvh * tokens) * head_dim + d);
+        float hi = lo;
+        for (int64_t t = 1; t < tokens; ++t) {
+            float value = load_as_float(keys, (kvh * tokens + t) * head_dim + d);
+            lo = fminf(lo, value); hi = fmaxf(hi, value);
+        }
+        int64_t output = (kvh * capacity_pages + page) * head_dim + d;
+        page_min[output] = lo; page_max[output] = hi;
+    }
+}
+
+template <typename scalar_t>
+__global__ void fier_update_kernel(
+    const scalar_t* __restrict__ keys, int32_t* __restrict__ packed,
+    scalar_t* __restrict__ group_min, scalar_t* __restrict__ group_max,
+    int64_t tokens, int64_t head_dim, int64_t storage_words,
+    int64_t storage_groups, int64_t word, int64_t group) {
+    int64_t kvh = blockIdx.x;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float lo = load_as_float(keys, (kvh * tokens) * head_dim + d);
+        float hi = lo;
+        for (int64_t t = 1; t < tokens; ++t) {
+            float value = load_as_float(keys, (kvh * tokens + t) * head_dim + d);
+            lo = fminf(lo, value); hi = fmaxf(hi, value);
+        }
+        uint32_t bits = 0;
+        scalar_t rounded_sum = static_cast<scalar_t>(lo + hi);
+        float threshold = static_cast<float>(rounded_sum) * 0.5f;
+        for (int64_t t = 0; t < tokens; ++t) {
+            float value = load_as_float(keys, (kvh * tokens + t) * head_dim + d);
+            if (value >= threshold) bits |= (uint32_t(1) << t);
+        }
+        packed[(kvh * head_dim + d) * storage_words + word] = static_cast<int32_t>(bits);
+        int64_t meta = (kvh * storage_groups + group) * head_dim + d;
+        group_min[meta] = static_cast<scalar_t>(lo);
+        group_max[meta] = static_cast<scalar_t>(hi);
+    }
+}
+
+template <typename scalar_t>
 __global__ void popkv_pack_g32_kernel(
     const scalar_t* __restrict__ keys,
     int32_t* __restrict__ k_sign,
@@ -461,6 +507,56 @@ __global__ void popkv_query_encode_dim_kernel(
         q_low[row * rep_groups + rep] = low;
         q_delta[row * rep_groups + rep] = high - low;
     }
+}
+
+void quest_update_cuda(
+    torch::Tensor keys, torch::Tensor page_min, torch::Tensor page_max, int64_t page) {
+    CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
+    CHECK_CUDA(page_min); CHECK_CUDA(page_max); CHECK_CONTIGUOUS(page_min); CHECK_CONTIGUOUS(page_max);
+    TORCH_CHECK(keys.dim() == 3 && keys.size(1) > 0, "active Quest keys must be non-empty");
+    TORCH_CHECK(page_min.scalar_type() == at::kFloat && page_max.scalar_type() == at::kFloat,
+                "Quest page metadata must be float32");
+    TORCH_CHECK(page_min.sizes() == page_max.sizes() && page_min.dim() == 3 &&
+                page_min.size(0) == keys.size(0) && page_min.size(2) == keys.size(2),
+                "Quest metadata shape mismatch");
+    TORCH_CHECK(page >= 0 && page < page_min.size(1), "Quest page offset out of bounds");
+    c10::cuda::CUDAGuard guard(keys.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "quest_update_cuda", [&] {
+        quest_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
+            keys.data_ptr<scalar_t>(), page_min.data_ptr<float>(), page_max.data_ptr<float>(),
+            keys.size(1), keys.size(2), page_min.size(1), page);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fier_update_cuda(
+    torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min,
+    torch::Tensor group_max, int64_t token_offset) {
+    CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
+    CHECK_CUDA(packed); CHECK_CONTIGUOUS(packed); CHECK_INT32(packed);
+    CHECK_CUDA(group_min); CHECK_CUDA(group_max); CHECK_CONTIGUOUS(group_min); CHECK_CONTIGUOUS(group_max);
+    TORCH_CHECK(keys.dim() == 3 && keys.size(1) > 0 && keys.size(1) <= 32,
+                "active FIER keys must contain 1..32 tokens");
+    TORCH_CHECK(group_min.scalar_type() == keys.scalar_type() && group_max.scalar_type() == keys.scalar_type(),
+                "FIER min/max dtype must match keys");
+    TORCH_CHECK(packed.dim() == 3 && packed.size(0) == keys.size(0) && packed.size(1) == keys.size(2),
+                "FIER packed shape mismatch");
+    TORCH_CHECK(group_min.sizes() == group_max.sizes() && group_min.dim() == 3 &&
+                group_min.size(0) == keys.size(0) && group_min.size(2) == keys.size(2),
+                "FIER metadata shape mismatch");
+    int64_t word = token_offset / 32, group = token_offset / 32;
+    TORCH_CHECK(token_offset >= 0 && token_offset % 32 == 0 && word < packed.size(2) &&
+                group < group_min.size(1), "FIER token offset out of bounds");
+    c10::cuda::CUDAGuard guard(keys.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_update_cuda", [&] {
+        fier_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
+            keys.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
+            group_min.data_ptr<scalar_t>(), group_max.data_ptr<scalar_t>(),
+            keys.size(1), keys.size(2), packed.size(2), group_min.size(1), word, group);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 static void launch_popkv_pack(

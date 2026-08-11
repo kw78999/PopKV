@@ -54,6 +54,19 @@ def pack_keys_into(
         _extension().pack_into_dim(keys, *packed, int(token_offset), dim_group_size)
 
 
+def update_quest_metadata(active_keys: torch.Tensor, page_min: torch.Tensor, page_max: torch.Tensor, *, page: int) -> None:
+    if active_keys.ndim != 3 or not active_keys.is_cuda or not active_keys.is_contiguous():
+        raise ValueError("active_keys must be contiguous CUDA [KV heads, tokens, head dim]")
+    _extension().quest_update(active_keys, page_min, page_max, int(page))
+
+
+def update_fier_metadata(active_keys: torch.Tensor, packed: torch.Tensor, group_min: torch.Tensor,
+                         group_max: torch.Tensor, *, token_offset: int) -> None:
+    if active_keys.ndim != 3 or not active_keys.is_cuda or not active_keys.is_contiguous():
+        raise ValueError("active_keys must be contiguous CUDA [KV heads, tokens, head dim]")
+    _extension().fier_update(active_keys, packed, group_min, group_max, int(token_offset))
+
+
 def allocate_query_encode_outputs(queries: torch.Tensor, *, dim_group_size: int = 32):
     """Allocate benchmark/debug outputs matching the fused scorer's query state."""
     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():

@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 
+void quest_update_cuda(torch::Tensor keys, torch::Tensor page_min, torch::Tensor page_max, int64_t page);
+void fier_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min, torch::Tensor group_max, int64_t token_offset);
 std::vector<torch::Tensor> popkv_pack_cuda(torch::Tensor keys, int64_t token_capacity);
 void popkv_pack_into_cuda(
     torch::Tensor keys, torch::Tensor k_sign, torch::Tensor k_mag,
@@ -23,6 +25,8 @@ torch::Tensor popkv_score_dim_cuda(
     torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("quest_update", &quest_update_cuda);
+    m.def("fier_update", &fier_update_cuda);
     m.def("pack", &popkv_pack_cuda);
     m.def("pack_into", &popkv_pack_into_cuda);
     m.def("score", &popkv_score_cuda);

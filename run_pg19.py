@@ -17,6 +17,21 @@ import torch.nn.functional as F
 from popkv import LlamaSparseDecoder, METHODS, RetrievalConfig, load_hf_model
 
 
+LATENCY_KEYS = (
+    "decode_ms", "frontend_ms", "qkv_rope_ms", "retrieval_stage_ms", "score_ms", "topk_ms",
+    "gather_ms", "attention_ms", "output_projection_ms", "mlp_ms",
+    "final_norm_lm_head_ms", "gpu_decode_ms", "gpu_component_sum_ms",
+    "gpu_unattributed_ms", "host_decode_residual_ms", "accounted_decode_ms",
+    "decode_closure_error_ms", "kv_update_ms", "retrieval_update_ms",
+    "retrieval_active_key_staging_ms", "retrieval_k_metadata_encoding_ms",
+    "retrieval_metadata_write_ms", "retrieval_group_sealing_ms",
+    "retrieval_gpu_component_sum_ms", "retrieval_gpu_unattributed_ms",
+    "retrieval_update_closure_error_ms",
+    "update_gpu_ms", "update_host_residual_ms", "update_ms", "token_selection_ms",
+    "token_cycle_ms", "generation_step_ms",
+)
+
+
 def arguments() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PG19 PPL and decode-latency comparison")
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B")
@@ -97,8 +112,13 @@ def write_results(output: Path, rows: list[dict[str, Any]], metadata: dict[str, 
         if not selected: continue
         mean_nll = sum(x["nll"] for x in selected) / len(selected)
         item = {"method": method, "tokens": len(selected), "perplexity": math.exp(mean_nll), "mean_nll": mean_nll}
-        for key in ("prepack_ms", "decode_ms", "search_ms", "score_ms", "topk_ms", "gather_ms", "attention_ms", "update_ms"):
-            item[key + "_per_token" if key != "prepack_ms" else key] = sum(x[key] for x in selected) / len(selected)
+        block_prepack = {x["block"]: x["prepack_ms"] for x in selected}
+        item["prepack_ms"] = sum(block_prepack.values()) / len(block_prepack)
+        for key in LATENCY_KEYS:
+            item[key + "_per_token"] = sum(x[key] for x in selected) / len(selected)
+        item["decode_closure_pct"] = 100.0 * item["accounted_decode_ms_per_token"] / item["decode_ms_per_token"]
+        item["gpu_component_closure_pct"] = 100.0 * item["gpu_component_sum_ms_per_token"] / item["gpu_decode_ms_per_token"]
+        item["generation_tokens_per_second"] = 1000.0 / item["generation_step_ms_per_token"]
         summary.append(item)
     if summary:
         with (output / "summary.csv").open("w", newline="") as handle:
@@ -143,16 +163,72 @@ def main() -> None:
                     kv, current, method=method, retrieval_caches=retrieval, return_new_kv=True,
                 )
                 sync(decoder.device); decode_ms = (time.perf_counter() - started) * 1000
-                started = time.perf_counter(); decoder.append_kv(kv, new_k, new_v)
-                if retrieval is not None: decoder.append_retrieval_caches(retrieval, new_k)
+                selection_started = time.perf_counter()
+                if decoder.device.type == "cuda":
+                    selection_start = torch.cuda.Event(enable_timing=True); selection_end = torch.cuda.Event(enable_timing=True)
+                    selection_start.record()
+                predicted_token = torch.argmax(logits)
+                if decoder.device.type == "cuda": selection_end.record()
+                sync(decoder.device)
+                token_selection_ms = (float(selection_start.elapsed_time(selection_end))
+                    if decoder.device.type == "cuda" else (time.perf_counter() - selection_started) * 1000)
+                del predicted_token
+                started = time.perf_counter()
+                if decoder.device.type == "cuda":
+                    update_start = torch.cuda.Event(enable_timing=True); update_middle = torch.cuda.Event(enable_timing=True)
+                    update_end = torch.cuda.Event(enable_timing=True); update_start.record()
+                decoder.append_kv(kv, new_k, new_v)
+                if decoder.device.type == "cuda": update_middle.record()
+                retrieval_timer = (None if retrieval is None else
+                    decoder.append_retrieval_caches(retrieval, new_k, measure=True))
+                if decoder.device.type == "cuda": update_end.record()
                 sync(decoder.device); update_ms = (time.perf_counter() - started) * 1000
+                if decoder.device.type == "cuda":
+                    kv_update_ms = float(update_start.elapsed_time(update_middle))
+                    retrieval_update_ms = (0.0 if retrieval is None else
+                        float(update_middle.elapsed_time(update_end)))
+                else:
+                    kv_update_ms, retrieval_update_ms = update_ms, 0.0
+                retrieval_parts = ({name: 0.0 for name in (
+                    "active_key_staging", "k_metadata_encoding", "metadata_write", "group_sealing",
+                )} if retrieval_timer is None else retrieval_timer.totals())
+                retrieval_component_sum_ms = sum(retrieval_parts.values())
+                retrieval_gpu_unattributed_ms = retrieval_update_ms - retrieval_component_sum_ms
+                retrieval_update_closure_error_ms = (retrieval_update_ms -
+                    retrieval_component_sum_ms - retrieval_gpu_unattributed_ms)
+                update_gpu_ms = kv_update_ms + retrieval_update_ms
+                update_host_residual_ms = update_ms - update_gpu_ms
+                host_decode_residual_ms = decode_ms - diag.gpu_decode_ms
+                accounted_decode_ms = diag.gpu_component_sum_ms + diag.gpu_unattributed_ms + host_decode_residual_ms
                 rows.append({
                     "block": block_idx, "step": step, "method": method,
                     "nll": float(F.cross_entropy(logits[None], target.to(decoder.device)[None]).item()),
                     "prepack_ms": prepack_ms, "decode_ms": decode_ms,
-                    "search_ms": diag.candidate_search_ms, "score_ms": diag.candidate_score_ms,
+                    "search_ms": diag.candidate_search_ms, "retrieval_stage_ms": diag.retrieval_stage_ms,
+                    "score_ms": diag.candidate_score_ms,
                     "topk_ms": diag.candidate_topk_ms, "gather_ms": diag.selected_gather_ms,
-                    "attention_ms": diag.selected_attention_ms, "update_ms": update_ms,
+                    "attention_ms": diag.selected_attention_ms,
+                    "frontend_ms": diag.frontend_ms, "qkv_rope_ms": diag.qkv_rope_ms,
+                    "output_projection_ms": diag.output_projection_ms, "mlp_ms": diag.mlp_ms,
+                    "final_norm_lm_head_ms": diag.final_norm_lm_head_ms,
+                    "gpu_decode_ms": diag.gpu_decode_ms,
+                    "gpu_component_sum_ms": diag.gpu_component_sum_ms,
+                    "gpu_unattributed_ms": diag.gpu_unattributed_ms,
+                    "host_decode_residual_ms": host_decode_residual_ms,
+                    "accounted_decode_ms": accounted_decode_ms,
+                    "decode_closure_error_ms": decode_ms - accounted_decode_ms,
+                    "kv_update_ms": kv_update_ms, "retrieval_update_ms": retrieval_update_ms,
+                    "retrieval_active_key_staging_ms": retrieval_parts["active_key_staging"],
+                    "retrieval_k_metadata_encoding_ms": retrieval_parts["k_metadata_encoding"],
+                    "retrieval_metadata_write_ms": retrieval_parts["metadata_write"],
+                    "retrieval_group_sealing_ms": retrieval_parts["group_sealing"],
+                    "retrieval_gpu_component_sum_ms": retrieval_component_sum_ms,
+                    "retrieval_gpu_unattributed_ms": retrieval_gpu_unattributed_ms,
+                    "retrieval_update_closure_error_ms": retrieval_update_closure_error_ms,
+                    "update_gpu_ms": update_gpu_ms, "update_host_residual_ms": update_host_residual_ms,
+                    "update_ms": update_ms, "token_selection_ms": token_selection_ms,
+                    "token_cycle_ms": decode_ms + update_ms,
+                    "generation_step_ms": decode_ms + token_selection_ms + update_ms,
                     "candidate_ratio": diag.candidate_ratio,
                 })
             write_results(output, rows, metadata)

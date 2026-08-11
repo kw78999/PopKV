@@ -91,14 +91,102 @@ class DecodeDiagnostics:
     available_tokens: int = 0
     sparse_head_calls: int = 0
     candidate_search_ms: float = 0.0
+    retrieval_stage_ms: float = 0.0
     candidate_score_ms: float = 0.0
     candidate_topk_ms: float = 0.0
     selected_gather_ms: float = 0.0
     selected_attention_ms: float = 0.0
+    frontend_ms: float = 0.0
+    qkv_rope_ms: float = 0.0
+    output_projection_ms: float = 0.0
+    mlp_ms: float = 0.0
+    final_norm_lm_head_ms: float = 0.0
+    gpu_decode_ms: float = 0.0
+    gpu_component_sum_ms: float = 0.0
+    gpu_unattributed_ms: float = 0.0
 
     @property
     def candidate_ratio(self) -> float:
         return 1.0 if self.available_tokens == 0 else self.selected_tokens / self.available_tokens
+
+
+_DECODE_STAGE_FIELDS = {
+    "frontend": "frontend_ms",
+    "qkv_rope": "qkv_rope_ms",
+    "retrieval_stage": "retrieval_stage_ms",
+    "score": "candidate_score_ms",
+    "topk": "candidate_topk_ms",
+    "gather": "selected_gather_ms",
+    "attention": "selected_attention_ms",
+    "output_projection": "output_projection_ms",
+    "mlp": "mlp_ms",
+    "final_norm_lm_head": "final_norm_lm_head_ms",
+}
+
+
+class _DecodeStageTimer:
+    """Measure mutually exclusive decode stages without intermediate synchronization."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.cuda = device.type == "cuda"
+        self.segments: list[tuple[str, Any, Any]] = []
+        if self.cuda:
+            self.total_start = torch.cuda.Event(enable_timing=True)
+            self.last = torch.cuda.Event(enable_timing=True)
+            self.total_start.record(); self.last.record()
+        else:
+            self.total_start = self.last = time.perf_counter()
+
+    def mark(self, name: str) -> None:
+        end = torch.cuda.Event(enable_timing=True) if self.cuda else time.perf_counter()
+        if self.cuda: end.record()
+        self.segments.append((name, self.last, end)); self.last = end
+
+    def finish(self, diagnostics: DecodeDiagnostics) -> None:
+        if self.cuda:
+            torch.cuda.synchronize(self.device)
+            elapsed = lambda start, end: float(start.elapsed_time(end))
+        else:
+            elapsed = lambda start, end: (end - start) * 1000.0
+        totals = {name: 0.0 for name in _DECODE_STAGE_FIELDS}
+        for name, start, end in self.segments: totals[name] += elapsed(start, end)
+        for name, field_name in _DECODE_STAGE_FIELDS.items(): setattr(diagnostics, field_name, totals[name])
+        diagnostics.candidate_search_ms = (diagnostics.retrieval_stage_ms +
+            diagnostics.candidate_score_ms + diagnostics.candidate_topk_ms)
+        diagnostics.gpu_component_sum_ms = sum(totals.values())
+        diagnostics.gpu_decode_ms = elapsed(self.total_start, self.last)
+        diagnostics.gpu_unattributed_ms = diagnostics.gpu_decode_ms - diagnostics.gpu_component_sum_ms
+
+
+_RETRIEVAL_UPDATE_STAGES = (
+    "active_key_staging", "k_metadata_encoding", "metadata_write", "group_sealing",
+)
+
+
+class RetrievalUpdateTimer:
+    """Record mutually exclusive GPU intervals across all sparse layers."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.cuda = device.type == "cuda"
+        self.segments: list[tuple[str, Any, Any]] = []
+        self.last = torch.cuda.Event(enable_timing=True) if self.cuda else time.perf_counter()
+        if self.cuda: self.last.record()
+
+    def mark(self, name: str) -> None:
+        if name not in _RETRIEVAL_UPDATE_STAGES:
+            raise ValueError(f"unknown retrieval update stage: {name}")
+        end = torch.cuda.Event(enable_timing=True) if self.cuda else time.perf_counter()
+        if self.cuda: end.record()
+        self.segments.append((name, self.last, end)); self.last = end
+
+    def totals(self) -> dict[str, float]:
+        result = {name: 0.0 for name in _RETRIEVAL_UPDATE_STAGES}
+        for name, start, end in self.segments:
+            elapsed = (float(start.elapsed_time(end)) if self.cuda else (end - start) * 1000.0)
+            result[name] += elapsed
+        return result
 
 
 def load_hf_model(
@@ -145,6 +233,10 @@ def load_hf_model(
     return model, tokenizer
 
 
+def _sparse_layer_indices(num_layers: int, full_layers: Sequence[int]) -> tuple[int, ...]:
+    return tuple(layer for layer in range(num_layers) if layer not in full_layers)
+
+
 def _append_current(indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
     current = torch.full(
         (*indices.shape[:-1], 1), num_tokens - 1, device=indices.device, dtype=torch.long,
@@ -165,24 +257,36 @@ def build_quest_cache(keys: torch.Tensor, *, page_size: int, reserve_tokens: int
         pages = keys[:, :sealed_tokens].float().view(kv_heads, sealed_pages, page_size, dim)
         page_min[:, :sealed_pages].copy_(pages.amin(dim=2))
         page_max[:, :sealed_pages].copy_(pages.amax(dim=2))
-    return QuestCache(
-        page_size, tokens, sealed_pages, page_min, page_max,
-        keys[:, sealed_tokens:].detach().clone().contiguous(),
-    )
+    active = keys[:, sealed_tokens:].detach().clone().contiguous()
+    cache = QuestCache(page_size, tokens, sealed_pages, page_min, page_max, active)
+    if int(active.shape[1]):
+        if active.is_cuda:
+            from popkv_cuda import update_quest_metadata
+            update_quest_metadata(active, page_min, page_max, page=sealed_pages)
+        else:
+            active_float = active.float()
+            page_min[:, sealed_pages].copy_(active_float.amin(dim=1))
+            page_max[:, sealed_pages].copy_(active_float.amax(dim=1))
+    return cache
+
+
+def quest_bounds(
+    cache: QuestCache, head_to_kv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pages = cache.sealed_pages + int(cache.active_keys.shape[1] > 0)
+    return (cache.page_min[:, :pages].index_select(0, head_to_kv),
+            cache.page_max[:, :pages].index_select(0, head_to_kv))
+
+
+def score_quest_bounds(queries: torch.Tensor, mins: torch.Tensor, maxs: torch.Tensor) -> torch.Tensor:
+    q = queries.float()[:, None]
+    return torch.maximum(q * mins, q * maxs).sum(dim=-1)
 
 
 def quest_scores(
-    queries: torch.Tensor, cache: QuestCache, current_keys: torch.Tensor,
-    head_to_kv: torch.Tensor,
+    queries: torch.Tensor, cache: QuestCache, head_to_kv: torch.Tensor,
 ) -> torch.Tensor:
-    staged = torch.cat([cache.active_keys, current_keys[:, None].detach()], dim=1).float()
-    page = cache.sealed_pages
-    cache.page_min[:, page].copy_(staged.amin(dim=1))
-    cache.page_max[:, page].copy_(staged.amax(dim=1))
-    mins = cache.page_min[:, : page + 1].index_select(0, head_to_kv)
-    maxs = cache.page_max[:, : page + 1].index_select(0, head_to_kv)
-    q = queries.float()[:, None]
-    return torch.maximum(q * mins, q * maxs).sum(dim=-1)
+    return score_quest_bounds(queries, *quest_bounds(cache, head_to_kv))
 
 
 def quest_indices(
@@ -200,16 +304,27 @@ def quest_indices(
     return indices, valid
 
 
-def append_quest(cache: QuestCache, keys: torch.Tensor) -> None:
+def append_quest(
+    cache: QuestCache, keys: torch.Tensor, timer: RetrievalUpdateTimer | None = None,
+) -> None:
     cache.active_keys = torch.cat([cache.active_keys, keys.detach()], dim=1).contiguous()
+    if timer: timer.mark("active_key_staging")
     cache.token_count += int(keys.shape[1])
-    if int(cache.active_keys.shape[1]) == cache.page_size:
-        page = cache.sealed_pages
+    page = cache.sealed_pages
+    if cache.active_keys.is_cuda:
+        from popkv_cuda import update_quest_metadata
+        update_quest_metadata(cache.active_keys, cache.page_min, cache.page_max, page=page)
+    else:
         active = cache.active_keys.float()
         cache.page_min[:, page].copy_(active.amin(dim=1))
         cache.page_max[:, page].copy_(active.amax(dim=1))
+    if timer:
+        timer.mark("k_metadata_encoding")
+        timer.mark("metadata_write")  # Stores are fused into the encoding kernel.
+    if int(cache.active_keys.shape[1]) == cache.page_size:
         cache.sealed_pages += 1
         cache.active_keys = cache.active_keys[:, :0].contiguous()
+    if timer: timer.mark("group_sealing")
 
 
 # ---- FIER ------------------------------------------------------------------
@@ -231,30 +346,37 @@ def build_fier_cache(keys: torch.Tensor, *, group_size: int, reserve_tokens: int
     min_storage[:, : mins.shape[1]].copy_(mins)
     max_storage[:, : maxs.shape[1]].copy_(maxs)
     sealed = (tokens // group_size) * group_size
-    return FIERCache(
+    cache = FIERCache(
         group_size, tokens, sealed, packed_storage, min_storage, max_storage,
         keys[:, sealed:].detach().clone().contiguous(),
     )
+    if int(cache.active_keys.shape[1]): write_fier_active(cache)
+    return cache
 
 
-def stage_fier(cache: FIERCache, current_keys: torch.Tensor) -> None:
-    from fier_triton import pack_keys
+def write_fier_active(cache: FIERCache) -> None:
+    from popkv_cuda import update_fier_metadata
 
-    staged = torch.cat([cache.active_keys, current_keys.detach()], dim=1).contiguous()
-    packed, mins, maxs = pack_keys(staged, group_size=cache.group_size)
-    word = cache.sealed_tokens // 32
-    group = cache.sealed_tokens // cache.group_size
-    cache.packed[:, :, word : word + packed.shape[2]].copy_(packed)
-    cache.group_min[:, group : group + mins.shape[1]].copy_(mins)
-    cache.group_max[:, group : group + maxs.shape[1]].copy_(maxs)
+    update_fier_metadata(
+        cache.active_keys, cache.packed, cache.group_min, cache.group_max,
+        token_offset=cache.sealed_tokens,
+    )
 
 
-def append_fier(cache: FIERCache, keys: torch.Tensor) -> None:
+def append_fier(
+    cache: FIERCache, keys: torch.Tensor, timer: RetrievalUpdateTimer | None = None,
+) -> None:
     cache.active_keys = torch.cat([cache.active_keys, keys.detach()], dim=1).contiguous()
+    if timer: timer.mark("active_key_staging")
     cache.token_count += int(keys.shape[1])
+    write_fier_active(cache)
+    if timer:
+        timer.mark("k_metadata_encoding")
+        timer.mark("metadata_write")  # Stores are fused into the encoding kernel.
     if int(cache.active_keys.shape[1]) == cache.group_size:
         cache.sealed_tokens += cache.group_size
         cache.active_keys = cache.active_keys[:, :0].contiguous()
+    if timer: timer.mark("group_sealing")
 
 
 # ---- Pop-KV ----------------------------------------------------------------
@@ -278,20 +400,27 @@ def build_popkv_cache(
     )
 
 
-def append_popkv(cache: PopKVCache, keys: torch.Tensor) -> None:
+def append_popkv(
+    cache: PopKVCache, keys: torch.Tensor, timer: RetrievalUpdateTimer | None = None,
+) -> None:
     from popkv_cuda import pack_keys_into
 
     cache.active_keys = torch.cat([cache.active_keys, keys.detach()], dim=1).contiguous()
+    if timer: timer.mark("active_key_staging")
     if cache.sealed_tokens + int(cache.active_keys.shape[1]) > int(cache.packed[0].shape[1]):
         raise RuntimeError("Pop-KV cache reserve exhausted")
     pack_keys_into(
         cache.active_keys, cache.packed, token_offset=cache.sealed_tokens,
         dim_group_size=cache.dim_group_size,
     )
+    if timer:
+        timer.mark("k_metadata_encoding")
+        timer.mark("metadata_write")  # Stores are fused into the encoding kernel.
     cache.token_count += 1
     if int(cache.active_keys.shape[1]) == cache.group_size:
         cache.sealed_tokens += cache.group_size
         cache.active_keys = cache.active_keys[:, :0].contiguous()
+    if timer: timer.mark("group_sealing")
 
 
 def _reference_pack_bits(bits: torch.Tensor) -> torch.Tensor:
@@ -679,7 +808,7 @@ class LlamaSparseDecoder:
         if method not in {"quest", "fier", "popkv"}:
             raise ValueError("retrieval caches are only used by sparse methods")
         layers: dict[int, QuestCache | FIERCache | PopKVCache] = {}
-        for layer in range(len(self.layers)):
+        for layer in _sparse_layer_indices(len(self.layers), self.retrieval.full_layers):
             keys, _ = _layer_cache(prefix_cache, layer)
             keys = keys[0].to(self.device)
             if method == "quest":
@@ -698,13 +827,64 @@ class LlamaSparseDecoder:
         return RetrievalCaches(method, layers)
 
     @torch.inference_mode()
-    def append_retrieval_caches(self, caches: RetrievalCaches, new_keys: Sequence[torch.Tensor]) -> None:
-        for layer, keys in enumerate(new_keys):
-            cache = caches.layers[layer]
-            if isinstance(cache, QuestCache): append_quest(cache, keys[0])
-            elif isinstance(cache, FIERCache): append_fier(cache, keys[0])
-            elif isinstance(cache, PopKVCache): append_popkv(cache, keys[0])
+    def append_retrieval_caches(
+        self, caches: RetrievalCaches, new_keys: Sequence[torch.Tensor], *, measure: bool = False,
+    ) -> RetrievalUpdateTimer | None:
+        if not measure:
+            for layer, keys in enumerate(new_keys):
+                cache = caches.layers.get(layer)
+                if cache is None: continue
+                if isinstance(cache, QuestCache): append_quest(cache, keys[0])
+                elif isinstance(cache, FIERCache): append_fier(cache, keys[0])
+                elif isinstance(cache, PopKVCache): append_popkv(cache, keys[0])
+                else: raise TypeError("unknown retrieval cache")
+            return None
+
+        # Batch equal phases across layers so measurement needs four events per
+        # token rather than four events per layer. Operations remain ordered on
+        # the same CUDA stream and retain the same cache semantics.
+        timer = RetrievalUpdateTimer(self.device)
+        items = [(cache, new_keys[layer][0]) for layer, cache in caches.layers.items()]
+        for cache, keys in items:
+            cache.active_keys = torch.cat([cache.active_keys, keys.detach()], dim=1).contiguous()
+            if isinstance(cache, QuestCache): cache.token_count += int(keys.shape[1])
+            elif isinstance(cache, FIERCache): cache.token_count += int(keys.shape[1])
+            elif isinstance(cache, PopKVCache):
+                if cache.sealed_tokens + int(cache.active_keys.shape[1]) > int(cache.packed[0].shape[1]):
+                    raise RuntimeError("Pop-KV cache reserve exhausted")
+                cache.token_count += 1
             else: raise TypeError("unknown retrieval cache")
+        timer.mark("active_key_staging")
+
+        for cache, _ in items:
+            if isinstance(cache, QuestCache):
+                if cache.active_keys.is_cuda:
+                    from popkv_cuda import update_quest_metadata
+                    update_quest_metadata(
+                        cache.active_keys, cache.page_min, cache.page_max, page=cache.sealed_pages,
+                    )
+                else:
+                    active = cache.active_keys.float()
+                    cache.page_min[:, cache.sealed_pages].copy_(active.amin(dim=1))
+                    cache.page_max[:, cache.sealed_pages].copy_(active.amax(dim=1))
+            elif isinstance(cache, FIERCache): write_fier_active(cache)
+            else:
+                from popkv_cuda import pack_keys_into
+                pack_keys_into(
+                    cache.active_keys, cache.packed, token_offset=cache.sealed_tokens,
+                    dim_group_size=cache.dim_group_size,
+                )
+        timer.mark("k_metadata_encoding")
+        timer.mark("metadata_write")  # Direct stores are fused into the kernels above.
+
+        for cache, _ in items:
+            group_size = cache.page_size if isinstance(cache, QuestCache) else cache.group_size
+            if int(cache.active_keys.shape[1]) == group_size:
+                if isinstance(cache, QuestCache): cache.sealed_pages += 1
+                else: cache.sealed_tokens += group_size
+                cache.active_keys = cache.active_keys[:, :0].contiguous()
+        timer.mark("group_sealing")
+        return timer
 
     @torch.inference_mode()
     def build_static_kv_cache(self, prefix_cache: Any, *, reserve_tokens: int) -> StaticKVCache:
@@ -751,6 +931,7 @@ class LlamaSparseDecoder:
             raise ValueError(f"method must be one of {METHODS}")
         if method != "full" and retrieval_caches is None:
             raise ValueError(f"{method} requires build_retrieval_caches()")
+        timer = _DecodeStageTimer(self.device)
         prefix_length = cache.length
         token = torch.as_tensor(token_id, device=self.device, dtype=torch.long).view(1, 1)
         hidden = self.backbone.embed_tokens(token)
@@ -758,8 +939,8 @@ class LlamaSparseDecoder:
         first_attn = self.layers[0].self_attn
         first_value = first_attn.v_proj(hidden).view(1, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
         cos, sin = self._position_embeddings(hidden, positions, first_value)
+        timer.mark("frontend")
         diag = DecodeDiagnostics()
-        score_events, topk_events, gather_events, attention_events = [], [], [], []
         new_keys, new_values = [], []
 
         for layer_idx, layer in enumerate(self.layers):
@@ -773,91 +954,83 @@ class LlamaSparseDecoder:
             prefix_k, prefix_v = _layer_cache(cache, layer_idx)
             if return_new_kv:
                 new_keys.append(k.detach()); new_values.append(v.detach())
+            timer.mark("qkv_rope")
 
             force_full = method == "full" or layer_idx in self.retrieval.full_layers
             if force_full:
                 def gather_full(): return torch.cat([prefix_k, k], 2), torch.cat([prefix_v, v], 2)
-                (all_k, all_v), ms = _timed(gather_full, q.device, gather_events); diag.selected_gather_ms += ms
+                all_k, all_v = gather_full(); timer.mark("gather")
                 def attend_full():
                     grouped = q[0].view(self.num_kv_heads, self.kv_group_size, 1, self.head_dim)
                     return F.scaled_dot_product_attention(
                         grouped, all_k[0, :, None], all_v[0, :, None], dropout_p=0.0, is_causal=False,
                     ).reshape(self.num_heads, self.head_dim)
-                output, ms = _timed(attend_full, q.device, attention_events); diag.selected_attention_ms += ms
+                output = attend_full(); timer.mark("attention")
             else:
                 num_tokens = prefix_length + 1
                 sparse_cache = retrieval_caches.layers[layer_idx]  # type: ignore[union-attr]
                 valid = None
                 if method == "quest":
                     assert isinstance(sparse_cache, QuestCache)
-                    scores, ms = _timed(
-                        lambda: quest_scores(q[0, :, 0], sparse_cache, k[0, :, 0], self.head_to_kv),
-                        q.device, score_events,
-                    ); diag.candidate_score_ms += ms
-                    (indices, valid), ms = _timed(
-                        lambda: quest_indices(scores, num_tokens=num_tokens,
-                            page_size=self.retrieval.quest_page_size, budget=self.retrieval.budget),
-                        q.device, topk_events,
-                    ); diag.candidate_topk_ms += ms
+                    scores = quest_scores(q[0, :, 0], sparse_cache, self.head_to_kv)
+                    timer.mark("score")
+                    indices, valid = quest_indices(scores, num_tokens=num_tokens,
+                        page_size=self.retrieval.quest_page_size, budget=self.retrieval.budget)
+                    timer.mark("topk")
                 elif method == "fier":
                     assert isinstance(sparse_cache, FIERCache)
                     from fier_triton import score_packed_batched
                     def score_fier():
-                        stage_fier(sparse_cache, k[0])
                         return score_packed_batched(
                             q[0, :, 0].unsqueeze(0), sparse_cache.packed,
                             sparse_cache.group_min, sparse_cache.group_max,
-                            self.head_to_kv, tokens=num_tokens, group_size=sparse_cache.group_size,
+                            self.head_to_kv, tokens=prefix_length, group_size=sparse_cache.group_size,
                         )
-                    scores, ms = _timed(score_fier, q.device, score_events); diag.candidate_score_ms += ms
+                    scores = score_fier(); timer.mark("score")
                     def topk_fier():
                         selected = torch.topk(
-                            scores[..., :prefix_length], k=min(self.retrieval.budget - 1, prefix_length),
+                            scores, k=min(self.retrieval.budget - 1, prefix_length),
                             dim=-1, sorted=False,
                         ).indices[0]
                         return _append_current(selected, num_tokens)
-                    indices, ms = _timed(topk_fier, q.device, topk_events); diag.candidate_topk_ms += ms
+                    indices = topk_fier(); timer.mark("topk")
                 else:
                     assert isinstance(sparse_cache, PopKVCache)
                     from popkv_cuda import score as score_popkv
-                    scores, ms = _timed(
-                        lambda: score_popkv(
-                            q[0, :, 0].unsqueeze(0).contiguous(), sparse_cache.packed,
-                            head_to_kv=self.head_to_kv, tokens=sparse_cache.token_count,
-                            dim_group_size=sparse_cache.dim_group_size,
-                        ), q.device, score_events,
-                    ); diag.candidate_score_ms += ms
+                    scores = score_popkv(
+                        q[0, :, 0].unsqueeze(0).contiguous(), sparse_cache.packed,
+                        head_to_kv=self.head_to_kv, tokens=sparse_cache.token_count,
+                        dim_group_size=sparse_cache.dim_group_size,
+                    )
+                    timer.mark("score")
                     def topk_popkv():
                         selected = torch.topk(
                             scores, k=min(self.retrieval.budget - 1, prefix_length),
                             dim=-1, sorted=False,
                         ).indices[0]
                         return _append_current(selected, num_tokens)
-                    indices, ms = _timed(topk_popkv, q.device, topk_events); diag.candidate_topk_ms += ms
+                    indices = topk_popkv(); timer.mark("topk")
 
                 diag.selected_tokens += int(indices.numel())
                 diag.available_tokens += num_tokens * self.num_heads
                 diag.sparse_head_calls += self.num_heads
                 def gather_sparse():
                     return gather_selected_kv(prefix_k[0], prefix_v[0], k[0, :, 0], v[0, :, 0], indices, self.head_to_kv)
-                (selected_k, selected_v), ms = _timed(gather_sparse, q.device, gather_events); diag.selected_gather_ms += ms
-                output, ms = _timed(
-                    lambda: selected_attention(q[0, :, 0], selected_k, selected_v, valid),
-                    q.device, attention_events,
-                ); diag.selected_attention_ms += ms
+                selected_k, selected_v = gather_sparse(); timer.mark("gather")
+                output = selected_attention(q[0, :, 0], selected_k, selected_v, valid)
+                timer.mark("attention")
 
             output = output.reshape(1, 1, -1).to(normalized.dtype)
             hidden = residual + attention.o_proj(output)
+            timer.mark("output_projection")
             residual = hidden
             hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+            timer.mark("mlp")
 
         hidden = self.backbone.norm(hidden)
         logits = self.model.lm_head(hidden).float()[0, -1]
-        diag.candidate_score_ms += _finish(score_events)
-        diag.candidate_topk_ms += _finish(topk_events)
-        diag.candidate_search_ms = diag.candidate_score_ms + diag.candidate_topk_ms
-        diag.selected_gather_ms += _finish(gather_events)
-        diag.selected_attention_ms += _finish(attention_events)
+        timer.mark("final_norm_lm_head")
+        timer.finish(diag)
         if return_new_kv:
             return logits, diag, new_keys, new_values
         return logits, diag
