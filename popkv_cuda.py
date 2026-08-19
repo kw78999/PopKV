@@ -7,6 +7,9 @@ import torch
 from torch.utils.cpp_extension import load
 
 _ROOT = Path(__file__).resolve().parent
+MAX_TOKEN_GROUP_SIZE = 4096
+SPECIALIZED_TOKEN_GROUP_SIZES = (8, 16, 32, 64, 128)
+SUPPORTED_DIM_KERNELS = ("g16", "g32", "g64-u32", "g64-u64")
 
 
 @lru_cache(maxsize=1)
@@ -22,6 +25,13 @@ def _extension():
     )
 
 
+def _validate_token_group_size(token_group_size: int) -> int:
+    value = int(token_group_size)
+    if not 1 <= value <= MAX_TOKEN_GROUP_SIZE:
+        raise ValueError(f"token_group_size must be between 1 and {MAX_TOKEN_GROUP_SIZE}")
+    return value
+
+
 def _validate_dim_group_size(dim_group_size: int) -> int:
     value = int(dim_group_size)
     if value not in (16, 32, 64):
@@ -29,29 +39,52 @@ def _validate_dim_group_size(dim_group_size: int) -> int:
     return value
 
 
+def _validate_dim_kernel(dim_group_size: int, dim_kernel: str | None) -> str:
+    default = {16: "g16", 32: "g32", 64: "g64-u32"}[dim_group_size]
+    value = default if dim_kernel is None or dim_kernel == "auto" else str(dim_kernel)
+    if value not in SUPPORTED_DIM_KERNELS:
+        raise ValueError(f"dim_kernel must be one of {SUPPORTED_DIM_KERNELS}")
+    expected = 64 if value.startswith("g64-") else int(value[1:])
+    if expected != dim_group_size:
+        raise ValueError(f"dim_kernel={value} requires dim_group_size={expected}")
+    return value
+
+
 def pack_keys(
-    keys: torch.Tensor, *, token_capacity: int | None = None, dim_group_size: int = 32,
+    keys: torch.Tensor, *, token_capacity: int | None = None,
+    token_group_size: int = 32, dim_group_size: int = 32,
 ):
     """Pack fixed uint32 K bitplanes plus G_dim low/delta representatives."""
     if keys.ndim != 3 or not keys.is_cuda or not keys.is_contiguous():
         raise ValueError("keys must be contiguous CUDA [KV heads, tokens, head dim]")
     capacity = int(keys.shape[1]) if token_capacity is None else int(token_capacity)
+    token_group_size = _validate_token_group_size(token_group_size)
     dim_group_size = _validate_dim_group_size(dim_group_size)
+    if dim_group_size != 32 and token_group_size not in SPECIALIZED_TOKEN_GROUP_SIZES:
+        raise ValueError("non-specialized token group sizes require dim_group_size=32")
     if dim_group_size == 32:
-        return tuple(_extension().pack(keys, capacity))
-    return tuple(_extension().pack_dim(keys, capacity, dim_group_size))
+        return tuple(_extension().pack(keys, capacity, token_group_size))
+    return tuple(_extension().pack_dim(
+        keys, capacity, dim_group_size, token_group_size,
+    ))
 
 
 def pack_keys_into(
-    keys: torch.Tensor, packed, *, token_offset: int, dim_group_size: int = 32,
+    keys: torch.Tensor, packed, *, token_offset: int,
+    token_group_size: int = 32, dim_group_size: int = 32,
 ) -> None:
     if keys.ndim != 3 or not keys.is_cuda or not keys.is_contiguous():
         raise ValueError("keys must be contiguous CUDA [KV heads, tokens, head dim]")
+    token_group_size = _validate_token_group_size(token_group_size)
     dim_group_size = _validate_dim_group_size(dim_group_size)
+    if dim_group_size != 32 and token_group_size not in SPECIALIZED_TOKEN_GROUP_SIZES:
+        raise ValueError("non-specialized token group sizes require dim_group_size=32")
     if dim_group_size == 32:
-        _extension().pack_into(keys, *packed, int(token_offset))
+        _extension().pack_into(keys, *packed, int(token_offset), token_group_size)
     else:
-        _extension().pack_into_dim(keys, *packed, int(token_offset), dim_group_size)
+        _extension().pack_into_dim(
+            keys, *packed, int(token_offset), dim_group_size, token_group_size,
+        )
 
 
 def update_quest_metadata(active_keys: torch.Tensor, page_min: torch.Tensor, page_max: torch.Tensor, *, page: int) -> None:
@@ -98,14 +131,16 @@ def query_encode(queries: torch.Tensor, *, out=None, dim_group_size: int = 32):
 
 def score(
     queries: torch.Tensor, packed, *, head_to_kv: torch.Tensor, tokens: int,
-    dim_group_size: int = 32,
+    dim_group_size: int = 32, dim_kernel: str | None = None,
 ) -> torch.Tensor:
     """Return Pop-KV approximate QK scores for every query head and token."""
     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
         raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
     dim_group_size = _validate_dim_group_size(dim_group_size)
+    dim_kernel = _validate_dim_kernel(dim_group_size, dim_kernel)
     if dim_group_size == 32:
         return _extension().score(queries, *packed, head_to_kv.contiguous(), int(tokens))
     return _extension().score_dim(
         queries, *packed, head_to_kv.contiguous(), int(tokens), dim_group_size,
+        dim_kernel == "g64-u64",
     )

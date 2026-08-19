@@ -10,3 +10,13 @@ data/
 outputs/
 results/**/predictions/
 *.log
+*.orig
+*.so
+*.o
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+.DS_Store

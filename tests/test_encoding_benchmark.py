@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from benchmark_encoding_overhead import DEFAULT_CONTEXTS, OCCUPANCIES, arguments, benchmark_cases, expected_shapes
-from benchmark_group_size import arguments as group_arguments, cases as group_cases
+from experiments.benchmarks.benchmark_encoding import DEFAULT_CONTEXTS, OCCUPANCIES, arguments, benchmark_cases, expected_shapes
+from experiments.benchmarks.benchmark_dimension_groups import arguments as group_arguments, cases as group_cases
 
 
 class EncodingBenchmarkTests(unittest.TestCase):
@@ -15,6 +15,7 @@ class EncodingBenchmarkTests(unittest.TestCase):
         self.assertEqual(shapes["query"], [1, 32, 128])
         self.assertEqual(shapes["query_bitplane_each"], [1, 32, 4])
         self.assertEqual(shapes["query_representative_each"], [1, 32, 4])
+        self.assertEqual(args.token_group_size, 32)
         self.assertEqual(shapes["packed_key_by_context"]["65536"], [8, 65536, 4])
         self.assertEqual(shapes["key_representative_by_context"]["65536"], [8, 65536, 4])
 
@@ -27,13 +28,19 @@ class EncodingBenchmarkTests(unittest.TestCase):
         self.assertEqual(incremental, set(OCCUPANCIES))
         self.assertEqual(incremental, set(range(1, 33)))
         self.assertIn("30_sparse_layers", scopes)
+        small = benchmark_cases(DEFAULT_CONTEXTS, 32, token_group_size=8)
+        small_incremental = {x.active_group_occupancy for x in small if x.operation == "key_incremental_encode"}
+        self.assertEqual(small_incremental, set(range(1, 9)))
+
         self.assertIn("32_layers", scopes)
 
     def test_group_size_benchmark_cases(self) -> None:
         args = group_arguments([])
         generated = group_cases(args)
-        self.assertEqual(len(generated), 12)
+        self.assertEqual(len(generated), 16)
         self.assertEqual({x["dim_group_size"] for x in generated}, {16, 32, 64})
+        self.assertEqual({x["dim_kernel"] for x in generated},
+                         {"g16", "g32", "g64-u32", "g64-u64"})
         self.assertEqual({x["context_length"] for x in generated}, set(DEFAULT_CONTEXTS))
 
 

@@ -57,6 +57,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dim-group-size", type=int, choices=(16, 32, 64), default=32)
+    parser.add_argument("--token-group-size", type=int, choices=(8, 16, 32, 64, 128), default=32)
     parser.add_argument("--layers", type=int, default=32)
     parser.add_argument("--output-dir", default="outputs/encoding_overhead")
     parser.add_argument("--dry-run", action="store_true")
@@ -72,7 +73,9 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def benchmark_cases(contexts: Iterable[int], layers: int) -> list[BenchmarkCase]:
+def benchmark_cases(
+    contexts: Iterable[int], layers: int, token_group_size: int = 32,
+) -> list[BenchmarkCase]:
     sparse_layers = layers - 2
     cases = [
         BenchmarkCase("query_encode", None, None, "one_layer", 1),
@@ -85,7 +88,7 @@ def benchmark_cases(contexts: Iterable[int], layers: int) -> list[BenchmarkCase]
             BenchmarkCase("key_prefix_encode", context, None, "one_layer", 1),
             BenchmarkCase("key_prefix_encode", context, None, f"{layers}_layers", layers),
         ))
-    for occupancy in OCCUPANCIES:
+    for occupancy in range(1, token_group_size + 1):
         cases.extend((
             BenchmarkCase("key_incremental_encode", None, occupancy, "one_layer", 1),
             BenchmarkCase("key_incremental_encode", None, occupancy, f"{layers}_layers", layers),
@@ -105,7 +108,7 @@ def expected_shapes(args: argparse.Namespace) -> dict[str, object]:
             str(t): [args.kv_heads, t, math.ceil(args.head_dim / args.dim_group_size)]
             for t in args.contexts
         },
-        "occupancies": list(OCCUPANCIES),
+        "occupancies": list(range(1, args.token_group_size + 1)),
     }
 
 
@@ -205,7 +208,7 @@ def add_cycle_means(rows: list[dict[str, object]], args: argparse.Namespace) -> 
         selected = [r for r in rows if r["operation"] == "key_incremental_encode" and r["scope"] == scope]
         for trial in range(1, args.trials + 1):
             values = [float(r["latency_us"]) for r in selected if r["trial"] == trial]
-            assert len(values) == 32
+            assert len(values) == args.token_group_size
             case = BenchmarkCase("key_incremental_encode", None, None, scope, 1 if scope == "one_layer" else args.layers)
             row = raw_rows(case, [statistics.mean(values)], args)[0]
             row["trial"] = trial
@@ -229,7 +232,7 @@ def print_summary(summary: list[dict[str, object]], args: argparse.Namespace) ->
         print(f"{context:7d}  {float(query['median_us']):15.3f}  {float(score['median_us']):19.3f}  {float(score['isolated_query_encode_to_score_ratio']):38.6f}")
     print("\nIncremental key pack medians (us)")
     print("occupancy  one_layer  synthetic_layers")
-    for occupancy in (1, 8, 16, 24, 32):
+    for occupancy in dict.fromkeys((1, args.token_group_size // 4, args.token_group_size // 2, 3 * args.token_group_size // 4, args.token_group_size)):
         one = next(x for x in summary if x["operation"] == "key_incremental_encode" and x["metric"] == "latency_us" and x["scope"] == "one_layer" and x["active_group_occupancy"] == occupancy)
         many = next(x for x in summary if x["operation"] == "key_incremental_encode" and x["metric"] == "latency_us" and x["scope"] == f"{args.layers}_layers" and x["active_group_occupancy"] == occupancy)
         print(f"{occupancy:9d}  {float(one['median_us']):9.3f}  {float(many['median_us']):16.3f}")
@@ -246,7 +249,7 @@ def run_cuda(args: argparse.Namespace) -> None:
     query_out = allocate_query_encode_outputs(query, dim_group_size=args.dim_group_size)
     head_to_kv = (torch.arange(args.q_heads, device=device, dtype=torch.long) * args.kv_heads // args.q_heads).contiguous()
     rows: list[dict[str, object]] = []
-    cases = benchmark_cases(args.contexts, args.layers)
+    cases = benchmark_cases(args.contexts, args.layers, args.token_group_size)
 
     query_op = lambda: query_encode(query, out=query_out, dim_group_size=args.dim_group_size)
     for case in (x for x in cases if x.operation == "query_encode"):
@@ -257,7 +260,7 @@ def run_cuda(args: argparse.Namespace) -> None:
         keys = torch.randn((args.kv_heads, context, args.head_dim), device=device, dtype=dtype)
         packed = _packed_storage(args.kv_heads, context, args.head_dim, device, args.dim_group_size)
         pack_op = lambda k=keys, p=packed: pack_keys_into(
-            k, p, token_offset=0, dim_group_size=args.dim_group_size,
+            k, p, token_offset=0, token_group_size=args.token_group_size, dim_group_size=args.dim_group_size,
         )
         pack_op(); torch.cuda.synchronize()
         for case in (x for x in cases if x.context_length == context and x.operation == "key_prefix_encode"):
@@ -271,11 +274,12 @@ def run_cuda(args: argparse.Namespace) -> None:
             rows.extend(raw_rows(case, measure_cuda(op, args), args))
         del keys, packed
 
-    incremental_inputs = {m: torch.randn((args.kv_heads, m, args.head_dim), device=device, dtype=dtype) for m in OCCUPANCIES}
-    incremental_out = _packed_storage(args.kv_heads, 32, args.head_dim, device, args.dim_group_size)
-    for occupancy in OCCUPANCIES:
+    occupancies = range(1, args.token_group_size + 1)
+    incremental_inputs = {m: torch.randn((args.kv_heads, m, args.head_dim), device=device, dtype=dtype) for m in occupancies}
+    incremental_out = _packed_storage(args.kv_heads, args.token_group_size, args.head_dim, device, args.dim_group_size)
+    for occupancy in occupancies:
         pack_op = lambda k=incremental_inputs[occupancy]: pack_keys_into(
-            k, incremental_out, token_offset=0, dim_group_size=args.dim_group_size,
+            k, incremental_out, token_offset=0, token_group_size=args.token_group_size, dim_group_size=args.dim_group_size,
         )
         for case in (x for x in cases if x.operation == "key_incremental_encode" and x.active_group_occupancy == occupancy):
             op = pack_op if case.calls_per_operation == 1 else lambda c=case.calls_per_operation: repeat_calls(pack_op, c)
@@ -297,8 +301,8 @@ def main(argv: list[str] | None = None) -> int:
     validate_reference()
     plan = {
         "config": vars(args), "expected_shapes": expected_shapes(args),
-        "case_count": len(benchmark_cases(args.contexts, args.layers)),
-        "contexts": list(args.contexts), "occupancies": list(OCCUPANCIES),
+        "case_count": len(benchmark_cases(args.contexts, args.layers, args.token_group_size)),
+        "contexts": list(args.contexts), "occupancies": list(range(1, args.token_group_size + 1)),
         "operations": list(OPERATIONS),
     }
     if args.dry_run or args.validate_only:
@@ -308,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     if not torch.cuda.is_available() or torch.device(args.device).type != "cuda":
         print("CUDA is required for latency measurement.")
         print("Use --dry-run / --validate-only locally, then run the following command on a CUDA GPU.")
-        print("python benchmark_encoding_overhead.py --device cuda --dtype bfloat16 --contexts 4096,16384,32768,65536 --q-heads 32 --kv-heads 8 --head-dim 128 --dim-group-size 32 --layers 32 --warmup 50 --repetitions 100 --trials 10 --output-dir outputs/encoding_overhead")
+        print("python -m experiments.benchmarks.benchmark_encoding --device cuda --dtype bfloat16 --contexts 4096,16384,32768,65536 --q-heads 32 --kv-heads 8 --head-dim 128 --dim-group-size 32 --layers 32 --warmup 50 --repetitions 100 --trials 10 --output-dir outputs/encoding_overhead")
         return 2
     run_cuda(args)
     return 0

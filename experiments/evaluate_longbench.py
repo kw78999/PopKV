@@ -75,10 +75,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--budgets", default="512,1024,2048,4096")
     p.add_argument("--samples-per-dataset", type=int, default=40)
     p.add_argument("--max-context", type=int, default=32768)
-    p.add_argument("--group-size", type=int, default=32,
-                   help="token-axis magnitude-threshold group size (fixed at 32)")
+    p.add_argument("--group-size", type=int, choices=(8, 16, 32, 64, 128), default=32,
+                   help="token-axis magnitude-threshold group size")
     p.add_argument("--dim-group-size", type=int, choices=(16, 32, 64), default=32,
                    help="dimensions sharing PopKV low/delta representatives")
+    p.add_argument("--dim-kernel", choices=("auto", "g16", "g32", "g64-u32", "g64-u64"),
+                   default="auto", help="specialized PopKV dimension-score kernel")
     p.add_argument("--quest-page-size", type=int, default=16)
     p.add_argument("--full-layers", default="0,1")
     p.add_argument("--seed", type=int, default=42)
@@ -236,7 +238,8 @@ def load_samples(tokenizer: Any, args: argparse.Namespace, datasets: tuple[str, 
 
 
 def method_specs(
-    methods: tuple[str, ...], budgets: tuple[int, ...], group: int, dim_group: int, page: int,
+    methods: tuple[str, ...], budgets: tuple[int, ...], group: int, dim_group: int,
+    dim_kernel: str, page: int,
 ) -> list[MethodSpec]:
     result: list[MethodSpec] = []
     for method in methods:
@@ -246,8 +249,10 @@ def method_specs(
             for budget in budgets:
                 if method == "quest":
                     label = f"quest_p{page}_b{budget}"
-                elif method == "popkv" and dim_group != 32:
-                    label = f"popkv_tg{group}_dg{dim_group}_b{budget}"
+                elif method == "popkv" and (dim_group != 32 or dim_kernel != "auto"):
+                    kernel = ({16: "g16", 32: "g32", 64: "g64-u32"}[dim_group]
+                              if dim_kernel == "auto" else dim_kernel)
+                    label = f"popkv_tg{group}_{kernel}_b{budget}"
                 else:
                     # Preserve existing G32/FIER labels for resumable outputs.
                     label = f"{method}_g{group}_b{budget}"
@@ -261,6 +266,7 @@ def retrieval_for(args: argparse.Namespace, spec: MethodSpec) -> RetrievalConfig
         quest_page_size=args.quest_page_size,
         group_size=args.group_size,
         dim_group_size=args.dim_group_size,
+        dim_kernel=args.dim_kernel,
         full_layers=int_tuple(args.full_layers),
     )
 
@@ -522,11 +528,12 @@ def main() -> None:
     unknown_datasets = set(datasets) - set(PROMPTS)
     if unknown_methods or unknown_datasets or not budgets:
         raise SystemExit(f"invalid methods={unknown_methods} datasets={unknown_datasets} budgets={budgets}")
-    specs = method_specs(methods, budgets, args.group_size, args.dim_group_size, args.quest_page_size)
+    specs = method_specs(methods, budgets, args.group_size, args.dim_group_size,
+                         args.dim_kernel, args.quest_page_size)
     output_dir = Path(args.output_dir)
     config = vars(args) | {
         "resolved_methods": [asdict(x) for x in specs], "resolved_datasets": datasets,
-        "gqa_policy": "per query-head Top-k; query heads sharing a KV head may select different token positions; exact FP K/V gathered by head_to_kv",
+        "gqa_policy": "per query-head Top-k; query heads sharing a KV head may select different token positions; exact FP K/V read directly by indexed attention using head_to_kv",
         "fier": "sequence-grouped g32 1-bit RTN, token Top-k, current token reserves one slot",
         "popkv": "Q/K sign and magnitude encoding with max/2 and min/2 thresholds; representative-weighted fused CUDA scoring; per-query-head Top-k; current token reserves one slot",
         "sink_recent_forced": False,

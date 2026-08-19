@@ -6,8 +6,8 @@
 #include <cstdint>
 #include <vector>
 
-// Orthogonal PopKV constants: only representative G_DIM is ablated.
-constexpr int kTokenGroupSize = 32;
+// Token threshold groups and dimension representative groups are orthogonal.
+// The packing word remains a fixed warp-sized 32 channels.
 constexpr int kPackingWordBits = 32;
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
@@ -76,7 +76,7 @@ __global__ void fier_update_kernel(
     }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int TOKEN_GROUP_SIZE>
 __global__ void popkv_pack_g32_kernel(
     const scalar_t* __restrict__ keys,
     int32_t* __restrict__ k_sign,
@@ -88,15 +88,17 @@ __global__ void popkv_pack_g32_kernel(
     int64_t words,
     int64_t num_groups,
     int64_t output_capacity,
-    int64_t token_offset) {
+    int64_t token_offset,
+    int64_t runtime_token_group_size) {
     int lane = threadIdx.x;
     int64_t linear = blockIdx.x;
     int64_t word = linear % words;
     int64_t group = (linear / words) % num_groups;
     int64_t kvh = linear / (words * num_groups);
     int64_t d = word * 32 + lane;
-    int64_t group_start = group * 32;
-    int64_t group_end = min(group_start + 32, tokens);
+    const int64_t token_group_size = TOKEN_GROUP_SIZE > 0 ? TOKEN_GROUP_SIZE : runtime_token_group_size;
+    int64_t group_start = group * token_group_size;
+    int64_t group_end = min(group_start + token_group_size, tokens);
     bool valid_dim = d < head_dim;
     float min_v = 0.0f, max_v = 0.0f;
     if (valid_dim && group_start < group_end) {
@@ -278,8 +280,8 @@ __global__ void popkv_query_encode_g32_kernel(
     }
 }
 
-// B_token and W_pack remain 32. Only representative grouping G_DIM varies.
-template <typename scalar_t>
+// W_pack remains 32. B_token and representative grouping G_DIM are orthogonal.
+template <typename scalar_t, int TOKEN_GROUP_SIZE>
 __global__ void popkv_pack_bits_kernel(
     const scalar_t* __restrict__ keys, int32_t* __restrict__ k_sign,
     int32_t* __restrict__ k_mag, int64_t tokens, int64_t head_dim,
@@ -291,8 +293,8 @@ __global__ void popkv_pack_bits_kernel(
     int64_t token_group = (linear / words) % token_groups;
     int64_t kvh = linear / (words * token_groups);
     int64_t d = word * 32 + lane;
-    int64_t group_start = token_group * 32;
-    int64_t group_end = min(group_start + 32, tokens);
+    int64_t group_start = token_group * TOKEN_GROUP_SIZE;
+    int64_t group_end = min(group_start + TOKEN_GROUP_SIZE, tokens);
     bool valid_dim = d < head_dim;
     float min_v = 0.0f, max_v = 0.0f;
     if (valid_dim && group_start < group_end) {
@@ -316,7 +318,7 @@ __global__ void popkv_pack_bits_kernel(
     }
 }
 
-template <typename scalar_t, int G_DIM>
+template <typename scalar_t, int G_DIM, int TOKEN_GROUP_SIZE>
 __global__ void popkv_pack_representatives_kernel(
     const scalar_t* __restrict__ keys, __half* __restrict__ low_mean,
     __half* __restrict__ delta_mean, int64_t tokens, int64_t head_dim,
@@ -327,8 +329,8 @@ __global__ void popkv_pack_representatives_kernel(
     int64_t rep = linear % rep_groups;
     int64_t token_group = (linear / rep_groups) % token_groups;
     int64_t kvh = linear / (rep_groups * token_groups);
-    int64_t group_start = token_group * 32;
-    int64_t group_end = min(group_start + 32, tokens);
+    int64_t group_start = token_group * TOKEN_GROUP_SIZE;
+    int64_t group_end = min(group_start + TOKEN_GROUP_SIZE, tokens);
     for (int64_t t = group_start; t < group_end; ++t) {
         float low_sum = 0.0f, high_sum = 0.0f;
         int low_count = 0, high_count = 0;
@@ -371,7 +373,148 @@ __global__ void popkv_pack_representatives_kernel(
     }
 }
 
-template <typename scalar_t, int G_DIM>
+// Head-dim 128 fast paths fuse bitplane and representative generation.  The
+// generic path above scans each token group once for bits and again for every
+// token/representative.  These kernels keep each dimension's extrema in a
+// register and reuse it for both outputs.
+template <typename scalar_t, int TOKEN_GROUP_SIZE>
+__global__ void popkv_pack_g16_fused_kernel(
+    const scalar_t* __restrict__ keys, int32_t* __restrict__ k_sign,
+    int32_t* __restrict__ k_mag, __half* __restrict__ low_mean,
+    __half* __restrict__ delta_mean, int64_t tokens, int64_t words,
+    int64_t token_groups, int64_t output_capacity, int64_t token_offset) {
+    int lane = threadIdx.x;
+    int64_t linear = blockIdx.x;
+    int64_t word = linear % words;
+    int64_t token_group = (linear / words) % token_groups;
+    int64_t kvh = linear / (words * token_groups);
+    int64_t d = word * 32 + lane;
+    int64_t group_start = token_group * TOKEN_GROUP_SIZE;
+    int64_t group_end = min(group_start + TOKEN_GROUP_SIZE, tokens);
+    float min_v = load_as_float(keys, (kvh * tokens + group_start) * 128 + d);
+    float max_v = min_v;
+    for (int64_t t = group_start + 1; t < group_end; ++t) {
+        float v = load_as_float(keys, (kvh * tokens + t) * 128 + d);
+        min_v = fminf(min_v, v); max_v = fmaxf(max_v, v);
+    }
+    for (int64_t t = group_start; t < group_end; ++t) {
+        float v = load_as_float(keys, (kvh * tokens + t) * 128 + d);
+        bool sign = v >= 0.0f;
+        bool mag = sign ? (v > max_v * 0.5f) : (v < min_v * 0.5f);
+        uint32_t sign_word = __ballot_sync(0xffffffffu, sign);
+        uint32_t mag_word = __ballot_sync(0xffffffffu, mag);
+        float low_sum = mag ? 0.0f : fabsf(v), high_sum = mag ? fabsf(v) : 0.0f;
+        int low_count = mag ? 0 : 1, high_count = mag ? 1 : 0;
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            low_sum += __shfl_down_sync(0xffffffffu, low_sum, offset, 16);
+            high_sum += __shfl_down_sync(0xffffffffu, high_sum, offset, 16);
+            low_count += __shfl_down_sync(0xffffffffu, low_count, offset, 16);
+            high_count += __shfl_down_sync(0xffffffffu, high_count, offset, 16);
+        }
+        int64_t token_out = kvh * output_capacity + token_offset + t;
+        if (lane == 0) {
+            k_sign[token_out * words + word] = static_cast<int32_t>(sign_word);
+            k_mag[token_out * words + word] = static_cast<int32_t>(mag_word);
+        }
+        if (lane == 0 || lane == 16) {
+            float low, high;
+            if (low_count == 0) {
+                low = high_count ? high_sum / high_count : 0.0f; high = low;
+            } else {
+                low = low_sum / low_count;
+                high = high_count ? high_sum / high_count : low;
+            }
+            int64_t rep = word * 2 + lane / 16;
+            int64_t rep_out = token_out * 8 + rep;
+            low_mean[rep_out] = __float2half_rn(low);
+            delta_mean[rep_out] = __float2half_rn(high - low);
+        }
+    }
+}
+
+template <typename scalar_t, int TOKEN_GROUP_SIZE>
+__global__ void popkv_pack_g64_fused_kernel(
+    const scalar_t* __restrict__ keys, int32_t* __restrict__ k_sign,
+    int32_t* __restrict__ k_mag, __half* __restrict__ low_mean,
+    __half* __restrict__ delta_mean, int64_t tokens, int64_t words,
+    int64_t token_groups, int64_t output_capacity, int64_t token_offset) {
+    int lane = threadIdx.x;
+    int64_t linear = blockIdx.x;
+    int64_t rep = linear % 2;
+    int64_t token_group = (linear / 2) % token_groups;
+    int64_t kvh = linear / (2 * token_groups);
+    int64_t d0 = rep * 64 + lane, d1 = d0 + 32;
+    int64_t group_start = token_group * TOKEN_GROUP_SIZE;
+    int64_t group_end = min(group_start + TOKEN_GROUP_SIZE, tokens);
+    float min0 = load_as_float(keys, (kvh * tokens + group_start) * 128 + d0);
+    float max0 = min0;
+    float min1 = load_as_float(keys, (kvh * tokens + group_start) * 128 + d1);
+    float max1 = min1;
+    for (int64_t t = group_start + 1; t < group_end; ++t) {
+        float v0 = load_as_float(keys, (kvh * tokens + t) * 128 + d0);
+        float v1 = load_as_float(keys, (kvh * tokens + t) * 128 + d1);
+        min0 = fminf(min0, v0); max0 = fmaxf(max0, v0);
+        min1 = fminf(min1, v1); max1 = fmaxf(max1, v1);
+    }
+    for (int64_t t = group_start; t < group_end; ++t) {
+        float v0 = load_as_float(keys, (kvh * tokens + t) * 128 + d0);
+        float v1 = load_as_float(keys, (kvh * tokens + t) * 128 + d1);
+        bool sign0 = v0 >= 0.0f, sign1 = v1 >= 0.0f;
+        bool mag0 = sign0 ? (v0 > max0 * 0.5f) : (v0 < min0 * 0.5f);
+        bool mag1 = sign1 ? (v1 > max1 * 0.5f) : (v1 < min1 * 0.5f);
+        uint32_t sign_word0 = __ballot_sync(0xffffffffu, sign0);
+        uint32_t sign_word1 = __ballot_sync(0xffffffffu, sign1);
+        uint32_t mag_word0 = __ballot_sync(0xffffffffu, mag0);
+        uint32_t mag_word1 = __ballot_sync(0xffffffffu, mag1);
+        float low_sum = (mag0 ? 0.0f : fabsf(v0)) + (mag1 ? 0.0f : fabsf(v1));
+        float high_sum = (mag0 ? fabsf(v0) : 0.0f) + (mag1 ? fabsf(v1) : 0.0f);
+        int low_count = (mag0 ? 0 : 1) + (mag1 ? 0 : 1);
+        int high_count = (mag0 ? 1 : 0) + (mag1 ? 1 : 0);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            low_sum += __shfl_down_sync(0xffffffffu, low_sum, offset);
+            high_sum += __shfl_down_sync(0xffffffffu, high_sum, offset);
+            low_count += __shfl_down_sync(0xffffffffu, low_count, offset);
+            high_count += __shfl_down_sync(0xffffffffu, high_count, offset);
+        }
+        if (lane == 0) {
+            int64_t token_out = kvh * output_capacity + token_offset + t;
+            int64_t word = rep * 2;
+            k_sign[token_out * words + word] = static_cast<int32_t>(sign_word0);
+            k_sign[token_out * words + word + 1] = static_cast<int32_t>(sign_word1);
+            k_mag[token_out * words + word] = static_cast<int32_t>(mag_word0);
+            k_mag[token_out * words + word + 1] = static_cast<int32_t>(mag_word1);
+            float low, high;
+            if (low_count == 0) {
+                low = high_count ? high_sum / high_count : 0.0f; high = low;
+            } else {
+                low = low_sum / low_count;
+                high = high_count ? high_sum / high_count : low;
+            }
+            int64_t rep_out = token_out * 2 + rep;
+            low_mean[rep_out] = __float2half_rn(low);
+            delta_mean[rep_out] = __float2half_rn(high - low);
+        }
+    }
+}
+
+__device__ __forceinline__ float popkv_reconstruct_u32(
+    uint32_t qs, uint32_t qm, uint32_t ks, uint32_t km, uint32_t mask,
+    float ql, float dq, float kl, float dk) {
+    qm &= mask; km &= mask;
+    uint32_t match = ~(qs ^ ks) & mask, both = qm & km;
+    int c_sign = 2 * __popc(match) - __popc(mask);
+    int c_q = 2 * __popc(match & qm) - __popc(qm);
+    int c_k = 2 * __popc(match & km) - __popc(km);
+    int c_qk = 2 * __popc(match & both) - __popc(both);
+    return fmaf(ql * kl, static_cast<float>(c_sign),
+        fmaf(dq * kl, static_cast<float>(c_q),
+        fmaf(ql * dk, static_cast<float>(c_k),
+             dq * dk * static_cast<float>(c_qk))));
+}
+
+template <typename scalar_t, int G_DIM, bool USE_UINT64_POPCOUNT = false>
 __global__ void popkv_score_dim_kernel(
     const scalar_t* __restrict__ queries, const int32_t* __restrict__ k_sign,
     const int32_t* __restrict__ k_mag, const __half* __restrict__ k_low,
@@ -431,7 +574,77 @@ __global__ void popkv_score_dim_kernel(
         int64_t bit_base = (kvh * token_capacity + token) * words;
         int64_t rep_base = (kvh * token_capacity + token) * rep_groups;
         float score = 0.0f;
-        for (int64_t rep = 0; rep < rep_groups; ++rep) {
+        if constexpr (USE_UINT64_POPCOUNT) {
+            // G_dim=64/head_dim=128 fast path. Each representative is exactly
+            // two adjacent uint32 words, loaded and counted as one uint64.
+#pragma unroll
+            for (int rep = 0; rep < 2; ++rep) {
+                const auto* qs64 = reinterpret_cast<const unsigned long long*>(q_sign);
+                const auto* qm64 = reinterpret_cast<const unsigned long long*>(q_mag);
+                const auto* ks64 = reinterpret_cast<const unsigned long long*>(k_sign + bit_base);
+                const auto* km64 = reinterpret_cast<const unsigned long long*>(k_mag + bit_base);
+                unsigned long long qm = qm64[rep], km = km64[rep];
+                unsigned long long match = ~(qs64[rep] ^ ks64[rep]);
+                unsigned long long both = qm & km;
+                int c_sign = 2 * __popcll(match) - 64;
+                int c_q = 2 * __popcll(match & qm) - __popcll(qm);
+                int c_k = 2 * __popcll(match & km) - __popcll(km);
+                int c_qk = 2 * __popcll(match & both) - __popcll(both);
+                float ql = q_low[rep], dq = q_delta[rep];
+                float kl = __half2float(k_low[rep_base + rep]);
+                float dk = __half2float(k_delta[rep_base + rep]);
+                score += fmaf(ql * kl, static_cast<float>(c_sign),
+                    fmaf(dq * kl, static_cast<float>(c_q),
+                    fmaf(ql * dk, static_cast<float>(c_k),
+                         dq * dk * static_cast<float>(c_qk))));
+            }
+        } else if (head_dim == 128) {
+            if constexpr (G_DIM == 16) {
+                // One packed uint32 word contains two independent G16 reps.
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    uint32_t qs = q_sign[w], qm = q_mag[w];
+                    uint32_t ks = static_cast<uint32_t>(k_sign[bit_base + w]);
+                    uint32_t km = static_cast<uint32_t>(k_mag[bit_base + w]);
+#pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        int rep = 2 * w + half;
+                        uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+                        score += popkv_reconstruct_u32(
+                            qs, qm, ks, km, mask, q_low[rep], q_delta[rep],
+                            __half2float(k_low[rep_base + rep]),
+                            __half2float(k_delta[rep_base + rep]));
+                    }
+                }
+            } else {
+                // G64-u32: exactly two uint32 words per representative. Keep
+                // the four count streams in uint32 POPC form and reconstruct
+                // only once after combining both halves.
+#pragma unroll
+                for (int rep = 0; rep < 2; ++rep) {
+                    int c_sign = 0, c_q = 0, c_k = 0, c_qk = 0;
+#pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        int w = 2 * rep + half;
+                        uint32_t qm = q_mag[w];
+                        uint32_t km = static_cast<uint32_t>(k_mag[bit_base + w]);
+                        uint32_t match = ~(q_sign[w] ^ static_cast<uint32_t>(k_sign[bit_base + w]));
+                        uint32_t both = qm & km;
+                        c_sign += 2 * __popc(match) - 32;
+                        c_q += 2 * __popc(match & qm) - __popc(qm);
+                        c_k += 2 * __popc(match & km) - __popc(km);
+                        c_qk += 2 * __popc(match & both) - __popc(both);
+                    }
+                    float ql = q_low[rep], dq = q_delta[rep];
+                    float kl = __half2float(k_low[rep_base + rep]);
+                    float dk = __half2float(k_delta[rep_base + rep]);
+                    score += fmaf(ql * kl, static_cast<float>(c_sign),
+                        fmaf(dq * kl, static_cast<float>(c_q),
+                        fmaf(ql * dk, static_cast<float>(c_k),
+                             dq * dk * static_cast<float>(c_qk))));
+                }
+            }
+        } else for (int64_t rep = 0; rep < rep_groups; ++rep) {
             int c_sign = 0, c_q = 0, c_k = 0, c_qk = 0;
             int64_t rep_start = rep * G_DIM, rep_end = min(rep_start + G_DIM, head_dim);
             int64_t first_word = rep_start / 32, last_word = (rep_end - 1) / 32;
@@ -559,28 +772,61 @@ void fier_update_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+static void check_token_group_size(int64_t token_group_size) {
+    TORCH_CHECK(token_group_size >= 1 && token_group_size <= 4096,
+                "token_group_size must be between 1 and 4096");
+}
+
+template <typename scalar_t, int TOKEN_GROUP_SIZE>
+static void launch_popkv_pack_specialized(
+    torch::Tensor keys, torch::Tensor k_sign, torch::Tensor k_mag,
+    torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset,
+    int64_t words, int64_t groups, int64_t capacity, cudaStream_t stream) {
+    int blocks = static_cast<int>(keys.size(0) * groups * words);
+    popkv_pack_g32_kernel<scalar_t, TOKEN_GROUP_SIZE><<<blocks, 32, 0, stream>>>(
+        keys.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+        reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()),
+        keys.size(1), keys.size(2), words, groups, capacity, token_offset,
+        TOKEN_GROUP_SIZE);
+}
+
 static void launch_popkv_pack(
     torch::Tensor keys, torch::Tensor k_sign, torch::Tensor k_mag,
-    torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset) {
-    int64_t kv_heads = keys.size(0), tokens = keys.size(1), head_dim = keys.size(2);
+    torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset,
+    int64_t token_group_size) {
+    int64_t tokens = keys.size(1), head_dim = keys.size(2);
     int64_t words = (head_dim + 31) / 32;
-    int64_t capacity = k_sign.size(1), groups = (tokens + 31) / 32;
-    int blocks = static_cast<int>(kv_heads * groups * words);
+    int64_t capacity = k_sign.size(1), groups = (tokens + token_group_size - 1) / token_group_size;
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "popkv_pack_cuda", [&] {
-        popkv_pack_g32_kernel<scalar_t><<<blocks, 32, 0, stream>>>(
-            keys.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
-            reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
-            reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()),
-            tokens, head_dim, words, groups, capacity, token_offset);
+        switch (token_group_size) {
+            case 8: launch_popkv_pack_specialized<scalar_t, 8>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, words, groups, capacity, stream); break;
+            case 16: launch_popkv_pack_specialized<scalar_t, 16>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, words, groups, capacity, stream); break;
+            case 32: launch_popkv_pack_specialized<scalar_t, 32>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, words, groups, capacity, stream); break;
+            default: {
+                int blocks = static_cast<int>(keys.size(0) * groups * words);
+                popkv_pack_g32_kernel<scalar_t, 0><<<blocks, 32, 0, stream>>>(
+                    keys.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+                    reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
+                    reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()),
+                    keys.size(1), keys.size(2), words, groups, capacity, token_offset,
+                    token_group_size);
+                break;
+            }
+            case 64: launch_popkv_pack_specialized<scalar_t, 64>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, words, groups, capacity, stream); break;
+            case 128: launch_popkv_pack_specialized<scalar_t, 128>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, words, groups, capacity, stream); break;
+        }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-std::vector<torch::Tensor> popkv_pack_cuda(torch::Tensor keys, int64_t token_capacity) {
+std::vector<torch::Tensor> popkv_pack_cuda(
+    torch::Tensor keys, int64_t token_capacity, int64_t token_group_size) {
     CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
     TORCH_CHECK(keys.dim() == 3, "keys must be [KVH, T, D]");
     TORCH_CHECK(token_capacity >= keys.size(1), "token capacity is too small");
+    check_token_group_size(token_group_size);
     c10::cuda::CUDAGuard guard(keys.device());
     int64_t words = (keys.size(2) + 31) / 32;
     auto shape = std::vector<int64_t>{keys.size(0), token_capacity, words};
@@ -588,13 +834,14 @@ std::vector<torch::Tensor> popkv_pack_cuda(torch::Tensor keys, int64_t token_cap
     auto k_mag = torch::empty(shape, keys.options().dtype(torch::kInt32));
     auto low_mean = torch::empty(shape, keys.options().dtype(torch::kFloat16));
     auto delta_mean = torch::empty(shape, keys.options().dtype(torch::kFloat16));
-    launch_popkv_pack(keys, k_sign, k_mag, low_mean, delta_mean, 0);
+    launch_popkv_pack(keys, k_sign, k_mag, low_mean, delta_mean, 0, token_group_size);
     return {k_sign, k_mag, low_mean, delta_mean};
 }
 
 void popkv_pack_into_cuda(
     torch::Tensor keys, torch::Tensor k_sign, torch::Tensor k_mag,
-    torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset) {
+    torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset,
+    int64_t token_group_size) {
     CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
     CHECK_CUDA(k_sign); CHECK_CUDA(k_mag); CHECK_CUDA(low_mean); CHECK_CUDA(delta_mean);
     CHECK_CONTIGUOUS(k_sign); CHECK_CONTIGUOUS(k_mag);
@@ -604,46 +851,81 @@ void popkv_pack_into_cuda(
                 "Pop-KV representative metadata must be float16");
     TORCH_CHECK(token_offset >= 0 && token_offset + keys.size(1) <= k_sign.size(1),
                 "Pop-KV cache capacity exceeded");
+    check_token_group_size(token_group_size);
     c10::cuda::CUDAGuard guard(keys.device());
-    launch_popkv_pack(keys, k_sign, k_mag, low_mean, delta_mean, token_offset);
+    launch_popkv_pack(
+        keys, k_sign, k_mag, low_mean, delta_mean, token_offset, token_group_size);
+}
+
+template <typename scalar_t, int TOKEN_GROUP_SIZE>
+static void launch_popkv_pack_dim_specialized(
+    torch::Tensor keys, torch::Tensor k_sign, torch::Tensor k_mag,
+    torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset,
+    int64_t dim_group_size, int64_t words, int64_t rep_groups,
+    int64_t token_groups, int64_t capacity, cudaStream_t stream) {
+    if (keys.size(2) == 128 && dim_group_size == 16) {
+        popkv_pack_g16_fused_kernel<scalar_t, TOKEN_GROUP_SIZE><<<keys.size(0) * token_groups * words, 32, 0, stream>>>(
+            keys.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+            reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()), keys.size(1), words,
+            token_groups, capacity, token_offset);
+        return;
+    }
+    if (keys.size(2) == 128 && dim_group_size == 64) {
+        popkv_pack_g64_fused_kernel<scalar_t, TOKEN_GROUP_SIZE><<<keys.size(0) * token_groups * rep_groups, 32, 0, stream>>>(
+            keys.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+            reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()), keys.size(1), words,
+            token_groups, capacity, token_offset);
+        return;
+    }
+    popkv_pack_bits_kernel<scalar_t, TOKEN_GROUP_SIZE><<<keys.size(0) * token_groups * words, 32, 0, stream>>>(
+        keys.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+        keys.size(1), keys.size(2), words, token_groups, capacity, token_offset);
+    if (dim_group_size == 16) {
+        popkv_pack_representatives_kernel<scalar_t, 16, TOKEN_GROUP_SIZE><<<keys.size(0) * token_groups * rep_groups, 32, 0, stream>>>(
+            keys.data_ptr<scalar_t>(), reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()), keys.size(1), keys.size(2),
+            rep_groups, token_groups, capacity, token_offset);
+    } else {
+        popkv_pack_representatives_kernel<scalar_t, 64, TOKEN_GROUP_SIZE><<<keys.size(0) * token_groups * rep_groups, 32, 0, stream>>>(
+            keys.data_ptr<scalar_t>(), reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()), keys.size(1), keys.size(2),
+            rep_groups, token_groups, capacity, token_offset);
+    }
 }
 
 static void launch_popkv_pack_dim(
     torch::Tensor keys, torch::Tensor k_sign, torch::Tensor k_mag,
     torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset,
-    int64_t dim_group_size) {
-    int64_t kv_heads = keys.size(0), tokens = keys.size(1), head_dim = keys.size(2);
+    int64_t dim_group_size, int64_t token_group_size) {
+    int64_t tokens = keys.size(1), head_dim = keys.size(2);
     int64_t words = (head_dim + 31) / 32;
     int64_t rep_groups = (head_dim + dim_group_size - 1) / dim_group_size;
-    int64_t token_groups = (tokens + 31) / 32, capacity = k_sign.size(1);
+    int64_t token_groups = (tokens + token_group_size - 1) / token_group_size, capacity = k_sign.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "popkv_pack_dim_cuda", [&] {
-        popkv_pack_bits_kernel<scalar_t><<<kv_heads * token_groups * words, 32, 0, stream>>>(
-            keys.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
-            tokens, head_dim, words, token_groups, capacity, token_offset);
-        if (dim_group_size == 16) {
-            popkv_pack_representatives_kernel<scalar_t, 16><<<kv_heads * token_groups * rep_groups, 32, 0, stream>>>(
-                keys.data_ptr<scalar_t>(), reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
-                reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()), tokens, head_dim,
-                rep_groups, token_groups, capacity, token_offset);
-        } else {
-            popkv_pack_representatives_kernel<scalar_t, 64><<<kv_heads * token_groups * rep_groups, 32, 0, stream>>>(
-                keys.data_ptr<scalar_t>(), reinterpret_cast<__half*>(low_mean.data_ptr<at::Half>()),
-                reinterpret_cast<__half*>(delta_mean.data_ptr<at::Half>()), tokens, head_dim,
-                rep_groups, token_groups, capacity, token_offset);
+        switch (token_group_size) {
+            case 8: launch_popkv_pack_dim_specialized<scalar_t, 8>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, dim_group_size, words, rep_groups, token_groups, capacity, stream); break;
+            case 16: launch_popkv_pack_dim_specialized<scalar_t, 16>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, dim_group_size, words, rep_groups, token_groups, capacity, stream); break;
+            case 32: launch_popkv_pack_dim_specialized<scalar_t, 32>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, dim_group_size, words, rep_groups, token_groups, capacity, stream); break;
+            case 64: launch_popkv_pack_dim_specialized<scalar_t, 64>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, dim_group_size, words, rep_groups, token_groups, capacity, stream); break;
+            case 128: launch_popkv_pack_dim_specialized<scalar_t, 128>(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, dim_group_size, words, rep_groups, token_groups, capacity, stream); break;
         }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 std::vector<torch::Tensor> popkv_pack_dim_cuda(
-    torch::Tensor keys, int64_t token_capacity, int64_t dim_group_size) {
+    torch::Tensor keys, int64_t token_capacity, int64_t dim_group_size,
+    int64_t token_group_size) {
     CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
     TORCH_CHECK(keys.dim() == 3 && keys.size(1) > 0 && keys.size(2) > 0,
                 "keys must be [KVH, non-empty tokens, non-empty head dim]");
     TORCH_CHECK(token_capacity >= keys.size(1), "token capacity is too small");
     TORCH_CHECK(dim_group_size == 16 || dim_group_size == 64,
                 "specialized dim group must be 16 or 64");
+    check_token_group_size(token_group_size);
     c10::cuda::CUDAGuard guard(keys.device());
     int64_t words = (keys.size(2) + 31) / 32;
     int64_t reps = (keys.size(2) + dim_group_size - 1) / dim_group_size;
@@ -653,14 +935,15 @@ std::vector<torch::Tensor> popkv_pack_dim_cuda(
     auto k_mag = torch::empty(bit_shape, keys.options().dtype(torch::kInt32));
     auto low_mean = torch::empty(rep_shape, keys.options().dtype(torch::kFloat16));
     auto delta_mean = torch::empty(rep_shape, keys.options().dtype(torch::kFloat16));
-    launch_popkv_pack_dim(keys, k_sign, k_mag, low_mean, delta_mean, 0, dim_group_size);
+    launch_popkv_pack_dim(
+        keys, k_sign, k_mag, low_mean, delta_mean, 0, dim_group_size, token_group_size);
     return {k_sign, k_mag, low_mean, delta_mean};
 }
 
 void popkv_pack_into_dim_cuda(
     torch::Tensor keys, torch::Tensor k_sign, torch::Tensor k_mag,
     torch::Tensor low_mean, torch::Tensor delta_mean, int64_t token_offset,
-    int64_t dim_group_size) {
+    int64_t dim_group_size, int64_t token_group_size) {
     CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
     CHECK_CUDA(k_sign); CHECK_CUDA(k_mag); CHECK_CUDA(low_mean); CHECK_CUDA(delta_mean);
     CHECK_CONTIGUOUS(k_sign); CHECK_CONTIGUOUS(k_mag);
@@ -670,6 +953,7 @@ void popkv_pack_into_dim_cuda(
                 "Pop-KV representative metadata must be float16");
     TORCH_CHECK(dim_group_size == 16 || dim_group_size == 64,
                 "specialized dim group must be 16 or 64");
+    check_token_group_size(token_group_size);
     TORCH_CHECK(keys.dim() == 3 && token_offset >= 0 &&
                 token_offset + keys.size(1) <= k_sign.size(1), "Pop-KV cache capacity exceeded");
     int64_t words = (keys.size(2) + 31) / 32;
@@ -683,7 +967,8 @@ void popkv_pack_into_dim_cuda(
                 low_mean.device() == keys.device() && delta_mean.device() == keys.device(),
                 "Pop-KV packing tensors must share a CUDA device");
     c10::cuda::CUDAGuard guard(keys.device());
-    launch_popkv_pack_dim(keys, k_sign, k_mag, low_mean, delta_mean, token_offset, dim_group_size);
+    launch_popkv_pack_dim(keys, k_sign, k_mag, low_mean, delta_mean, token_offset,
+                          dim_group_size, token_group_size);
 }
 
 torch::Tensor popkv_score_cuda(
@@ -716,7 +1001,8 @@ torch::Tensor popkv_score_cuda(
 torch::Tensor popkv_score_dim_cuda(
     torch::Tensor queries, torch::Tensor k_sign, torch::Tensor k_mag,
     torch::Tensor low_mean, torch::Tensor delta_mean,
-    torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size) {
+    torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size,
+    bool use_uint64_popcount) {
     CHECK_CUDA(queries); CHECK_CONTIGUOUS(queries); CHECK_FLOATISH(queries);
     CHECK_CUDA(k_sign); CHECK_CUDA(k_mag); CHECK_CUDA(low_mean); CHECK_CUDA(delta_mean);
     CHECK_CUDA(head_to_kv); CHECK_CONTIGUOUS(head_to_kv);
@@ -726,10 +1012,14 @@ torch::Tensor popkv_score_dim_cuda(
     TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
     TORCH_CHECK(dim_group_size == 16 || dim_group_size == 64,
                 "specialized dim group must be 16 or 64");
+    TORCH_CHECK(!use_uint64_popcount || dim_group_size == 64,
+                "uint64 popcount is only valid for dim_group_size=64");
     c10::cuda::CUDAGuard guard(queries.device());
     int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
     int64_t capacity = k_sign.size(1), words = (head_dim + 31) / 32;
     int64_t reps = (head_dim + dim_group_size - 1) / dim_group_size;
+    TORCH_CHECK(!use_uint64_popcount || (head_dim == 128 && words == 4 && reps == 2),
+                "G64 uint64 popcount kernel requires head_dim=128");
     TORCH_CHECK(tokens > 0 && tokens <= capacity, "invalid score token count");
     TORCH_CHECK(k_sign.size(2) == words && k_mag.sizes().vec() == k_sign.sizes().vec(),
                 "packed bitplane shape mismatch");
@@ -744,13 +1034,19 @@ torch::Tensor popkv_score_dim_cuda(
     size_t shared = static_cast<size_t>(2 * words + 2 * reps) * sizeof(uint32_t);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_dim_cuda", [&] {
         if (dim_group_size == 16) {
-            popkv_score_dim_kernel<scalar_t, 16><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
+            popkv_score_dim_kernel<scalar_t, 16, false><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
+                queries.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+                reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()), head_to_kv.data_ptr<int64_t>(),
+                scores.data_ptr<float>(), batch, q_heads, capacity, tokens, words, reps, head_dim);
+        } else if (use_uint64_popcount) {
+            popkv_score_dim_kernel<scalar_t, 64, true><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
                 queries.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
                 reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
                 reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()), head_to_kv.data_ptr<int64_t>(),
                 scores.data_ptr<float>(), batch, q_heads, capacity, tokens, words, reps, head_dim);
         } else {
-            popkv_score_dim_kernel<scalar_t, 64><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
+            popkv_score_dim_kernel<scalar_t, 64, false><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
                 queries.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
                 reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
                 reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()), head_to_kv.data_ptr<int64_t>(),

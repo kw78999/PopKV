@@ -10,6 +10,9 @@ from pathlib import Path
 
 import torch
 
+DIM_KERNELS = ("g16", "g32", "g64-u32", "g64-u64")
+KERNEL_DIM = {"g16": 16, "g32": 32, "g64-u32": 64, "g64-u64": 64}
+
 
 def parse_ints(value: str) -> tuple[int, ...]:
     result = tuple(int(x) for x in value.split(",") if x.strip())
@@ -18,12 +21,19 @@ def parse_ints(value: str) -> tuple[int, ...]:
     return result
 
 
+def parse_strings(value: str) -> tuple[str, ...]:
+    result = tuple(x.strip() for x in value.split(",") if x.strip())
+    if not result:
+        raise argparse.ArgumentTypeError("expected a non-empty comma-separated list")
+    return result
+
+
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PopKV dimension-group score microbenchmark")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--contexts", type=parse_ints, default=(4096, 16384, 32768, 65536))
-    parser.add_argument("--dim-group-sizes", type=parse_ints, default=(16, 32, 64))
+    parser.add_argument("--dim-kernels", type=parse_strings, default=DIM_KERNELS)
     parser.add_argument("--q-heads", type=int, default=32)
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
@@ -35,8 +45,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
-    if set(args.dim_group_sizes) - {16, 32, 64}:
-        parser.error("--dim-group-sizes supports only 16,32,64")
+    if set(args.dim_kernels) - set(DIM_KERNELS):
+        parser.error(f"--dim-kernels supports only {','.join(DIM_KERNELS)}")
     if args.q_heads % args.kv_heads:
         parser.error("--q-heads must be a multiple of --kv-heads")
     if min(args.q_heads, args.kv_heads, args.head_dim, args.warmup, args.repetitions, args.trials) <= 0:
@@ -44,9 +54,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def cases(args: argparse.Namespace) -> list[dict[str, int]]:
-    return [{"dim_group_size": group, "context_length": context}
-            for group in args.dim_group_sizes for context in args.contexts]
+def cases(args: argparse.Namespace) -> list[dict[str, int | str]]:
+    return [{"dim_kernel": kernel, "dim_group_size": KERNEL_DIM[kernel],
+             "context_length": context}
+            for kernel in args.dim_kernels for context in args.contexts]
 
 
 def measure(operation, args: argparse.Namespace) -> list[float]:
@@ -72,12 +83,12 @@ def run(args: argparse.Namespace) -> None:
     mapping = (torch.arange(args.q_heads, device=device, dtype=torch.long) * args.kv_heads // args.q_heads).contiguous()
     raw, summary = [], []
     for case in cases(args):
-        group, context = case["dim_group_size"], case["context_length"]
+        kernel, group, context = case["dim_kernel"], case["dim_group_size"], case["context_length"]
         keys = torch.randn(args.kv_heads, context, args.head_dim, device=device, dtype=dtype)
         packed = pack_keys(keys.contiguous(), dim_group_size=group)
         torch.cuda.synchronize()
         operation = lambda p=packed, g=group, t=context: score(
-            query, p, head_to_kv=mapping, tokens=t, dim_group_size=g,
+            query, p, head_to_kv=mapping, tokens=t, dim_group_size=g, dim_kernel=kernel,
         )
         values = measure(operation, args)
         raw.extend({**case, "trial": trial, "score_ms": value,
@@ -91,9 +102,10 @@ def run(args: argparse.Namespace) -> None:
     for name, rows in (("group_size_score_raw.csv", raw), ("group_size_score_summary.csv", summary)):
         with (output / name).open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
-    print("G_dim  context  median_score_ms")
+    print("kernel    G_dim  context  median_score_ms")
     for row in summary:
-        print(f"{row['dim_group_size']:5d}  {row['context_length']:7d}  {row['median_score_ms']:.6f}")
+        print(f"{row['dim_kernel']:8s}  {row['dim_group_size']:5d}  "
+              f"{row['context_length']:7d}  {row['median_score_ms']:.6f}")
     print(f"results={output}")
 
 

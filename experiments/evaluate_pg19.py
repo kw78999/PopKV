@@ -40,10 +40,12 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--generate-tokens", type=int, default=128)
     p.add_argument("--num-blocks", type=int, default=1)
     p.add_argument("--budget", type=int, default=4096)
-    p.add_argument("--group-size", type=int, default=32,
-                   help="token-axis magnitude-threshold group size (fixed at 32)")
+    p.add_argument("--group-size", type=int, choices=(8, 16, 32, 64, 128), default=32,
+                   help="token-axis magnitude-threshold group size")
     p.add_argument("--dim-group-size", type=int, choices=(16, 32, 64), default=32,
                    help="dimensions sharing PopKV low/delta representatives")
+    p.add_argument("--dim-kernel", choices=("auto", "g16", "g32", "g64-u32", "g64-u64"),
+                   default="auto", help="specialized PopKV dimension-score kernel")
     p.add_argument("--quest-page-size", type=int, default=16)
     p.add_argument("--full-layers", default="0,1")
     p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -130,6 +132,7 @@ def main() -> None:
     args = arguments(); methods = parse_methods(args.methods)
     config = RetrievalConfig(
         budget=args.budget, group_size=args.group_size, dim_group_size=args.dim_group_size,
+        dim_kernel=args.dim_kernel,
         quest_page_size=args.quest_page_size,
         full_layers=tuple(int(x) for x in args.full_layers.split(",") if x.strip()),
     ); config.validate()

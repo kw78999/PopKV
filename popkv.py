@@ -1,7 +1,6 @@
-"""Pop-KV and three comparison attention paths used in the COLM workshop experiments.
+"""PopKV and the FullAttention, QUEST, and FIER comparison paths.
 
-The public API intentionally contains only the final Pop-KV method and the three
-baselines used in the paper: FullAttention, Quest, and FIER.
+This module contains the optimized implementations used by the paper evaluations.
 """
 from __future__ import annotations
 
@@ -9,16 +8,19 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence, TypeVar
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
 
 METHODS = ("full", "quest", "fier", "popkv")
 TOKEN_GROUP_SIZE = 32
+SPECIALIZED_TOKEN_GROUP_SIZES = (8, 16, 32, 64, 128)
+MAX_TOKEN_GROUP_SIZE = 4096
+SUPPORTED_TOKEN_GROUP_SIZES = SPECIALIZED_TOKEN_GROUP_SIZES
 PACKING_WORD_BITS = 32
 SUPPORTED_DIM_GROUP_SIZES = (16, 32, 64)
-T = TypeVar("T")
+SUPPORTED_DIM_KERNELS = ("auto", "g16", "g32", "g64-u32", "g64-u64")
 
 
 @dataclass(frozen=True)
@@ -26,16 +28,27 @@ class RetrievalConfig:
     budget: int = 4096
     group_size: int = 32  # token-axis magnitude-threshold group (B_token)
     dim_group_size: int = 32  # dimensions sharing low/delta representatives (G_dim)
+    dim_kernel: str = "auto"  # specialized score kernel; auto follows G_dim
     quest_page_size: int = 16
     full_layers: tuple[int, ...] = (0, 1)
 
     def validate(self) -> None:
         if self.budget <= 1:
             raise ValueError("budget must reserve at least one retrieved and one current token")
-        if self.group_size != TOKEN_GROUP_SIZE:
-            raise ValueError("token-axis group_size is fixed at 32")
+        if not 1 <= self.group_size <= MAX_TOKEN_GROUP_SIZE:
+            raise ValueError(f"group_size must be between 1 and {MAX_TOKEN_GROUP_SIZE}")
+        if self.dim_group_size != 32 and self.group_size not in SPECIALIZED_TOKEN_GROUP_SIZES:
+            raise ValueError("non-specialized token group sizes require dim_group_size=32")
         if self.dim_group_size not in SUPPORTED_DIM_GROUP_SIZES:
             raise ValueError("dim_group_size must be one of 16, 32, 64")
+        if self.dim_kernel not in SUPPORTED_DIM_KERNELS:
+            raise ValueError(f"dim_kernel must be one of {SUPPORTED_DIM_KERNELS}")
+        if self.dim_kernel != "auto":
+            expected = 64 if self.dim_kernel.startswith("g64-") else int(self.dim_kernel[1:])
+            if expected != self.dim_group_size:
+                raise ValueError(
+                    f"dim_kernel={self.dim_kernel} requires dim_group_size={expected}"
+                )
         if self.quest_page_size <= 0:
             raise ValueError("quest_page_size must be positive")
 
@@ -209,7 +222,7 @@ def load_hf_model(
                 token = get_token()
             except Exception:
                 token = None
-    torch_dtype = {
+    model_dtype = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
@@ -222,7 +235,7 @@ def load_hf_model(
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         token=token,
-        torch_dtype=torch_dtype,
+        dtype=model_dtype,
         device_map=device_map,
         low_cpu_mem_usage=True,
         attn_implementation=attention,
@@ -268,40 +281,6 @@ def build_quest_cache(keys: torch.Tensor, *, page_size: int, reserve_tokens: int
             page_min[:, sealed_pages].copy_(active_float.amin(dim=1))
             page_max[:, sealed_pages].copy_(active_float.amax(dim=1))
     return cache
-
-
-def quest_bounds(
-    cache: QuestCache, head_to_kv: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    pages = cache.sealed_pages + int(cache.active_keys.shape[1] > 0)
-    return (cache.page_min[:, :pages].index_select(0, head_to_kv),
-            cache.page_max[:, :pages].index_select(0, head_to_kv))
-
-
-def score_quest_bounds(queries: torch.Tensor, mins: torch.Tensor, maxs: torch.Tensor) -> torch.Tensor:
-    q = queries.float()[:, None]
-    return torch.maximum(q * mins, q * maxs).sum(dim=-1)
-
-
-def quest_scores(
-    queries: torch.Tensor, cache: QuestCache, head_to_kv: torch.Tensor,
-) -> torch.Tensor:
-    return score_quest_bounds(queries, *quest_bounds(cache, head_to_kv))
-
-
-def quest_indices(
-    scores: torch.Tensor, *, num_tokens: int, page_size: int, budget: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    page_budget = min(int(scores.shape[-1]), max(1, math.ceil(budget / page_size)))
-    pages = torch.topk(scores, k=page_budget, dim=-1, sorted=False).indices
-    offsets = torch.arange(page_size, device=scores.device)
-    indices = (pages[:, :, None] * page_size + offsets).flatten(1)
-    valid = indices.lt(num_tokens)
-    current = num_tokens - 1
-    has_current = (indices.eq(current) & valid).any(dim=-1)
-    indices[:, -1] = torch.where(has_current, indices[:, -1], indices.new_tensor(current))
-    valid[:, -1] = torch.where(has_current, valid[:, -1], valid.new_tensor(True))
-    return indices, valid
 
 
 def append_quest(
@@ -386,13 +365,16 @@ def build_popkv_cache(
 ) -> PopKVCache:
     from popkv_cuda import pack_keys
 
-    if group_size != 32:
-        raise ValueError("Pop-KV token-axis group size is fixed at 32")
+    if not 1 <= group_size <= MAX_TOKEN_GROUP_SIZE:
+        raise ValueError(f"Pop-KV group_size must be between 1 and {MAX_TOKEN_GROUP_SIZE}")
+    if dim_group_size != 32 and group_size not in SPECIALIZED_TOKEN_GROUP_SIZES:
+        raise ValueError("non-specialized token group sizes require dim_group_size=32")
     if dim_group_size not in (16, 32, 64):
         raise ValueError("dim_group_size must be one of 16, 32, 64")
     tokens = int(keys.shape[1])
     capacity = math.ceil((tokens + reserve_tokens) / group_size) * group_size
-    packed = pack_keys(keys.contiguous(), token_capacity=capacity, dim_group_size=dim_group_size)
+    packed = pack_keys(keys.contiguous(), token_capacity=capacity,
+                       token_group_size=group_size, dim_group_size=dim_group_size)
     sealed = (tokens // group_size) * group_size
     return PopKVCache(
         group_size, dim_group_size, tokens, sealed, packed,
@@ -411,6 +393,7 @@ def append_popkv(
         raise RuntimeError("Pop-KV cache reserve exhausted")
     pack_keys_into(
         cache.active_keys, cache.packed, token_offset=cache.sealed_tokens,
+        token_group_size=cache.group_size,
         dim_group_size=cache.dim_group_size,
     )
     if timer:
@@ -507,7 +490,7 @@ def reference_query_encode_g32(
     return reference_query_encode(queries, 32)
 
 
-def _reference_query_encode_g32_legacy(
+def _reference_query_encode_g32_oracle(
     queries: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Frozen release-semantics oracle used only by G32 regression tests."""
@@ -540,8 +523,8 @@ def reference_key_encode(
     """Reference key encoder with fixed uint32 packing and explicit axis groups."""
     if keys.ndim != 3 or keys.shape[-1] <= 0 or keys.shape[-2] <= 0:
         raise ValueError("keys must be [KV heads, tokens, non-empty head dim]")
-    if token_group_size != 32:
-        raise ValueError("token_group_size is fixed at 32")
+    if not 1 <= token_group_size <= MAX_TOKEN_GROUP_SIZE:
+        raise ValueError(f"token_group_size must be between 1 and {MAX_TOKEN_GROUP_SIZE}")
     if dim_group_size not in (16, 32, 64):
         raise ValueError("dim_group_size must be one of 16, 32, 64")
     k = keys.float()
@@ -560,7 +543,7 @@ def reference_key_encode(
     return _reference_pack_bits(sign), _reference_pack_bits(magnitude), low, delta
 
 
-def _popkv_reference_scores_g32_legacy(
+def _popkv_reference_scores_g32_oracle(
     queries: torch.Tensor, keys: torch.Tensor, *, head_to_kv: torch.Tensor, group_size: int = 32,
 ) -> torch.Tensor:
     """Readable reference for the final Pop-KV score used by correctness tests."""
@@ -701,54 +684,6 @@ def popkv_reference_bitwise_scores(
 
 # ---- Shared attention and model adapter ------------------------------------
 
-def gather_selected_kv(
-    prefix_keys: torch.Tensor, prefix_values: torch.Tensor,
-    current_keys: torch.Tensor, current_values: torch.Tensor,
-    indices: torch.Tensor, head_to_kv: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    prefix_tokens = int(prefix_keys.shape[1])
-    safe = indices.clamp_max(prefix_tokens - 1)
-    kv_heads = head_to_kv[:, None].expand_as(safe)
-    selected_keys = prefix_keys[kv_heads, safe]
-    selected_values = prefix_values[kv_heads, safe]
-    current_mask = indices.eq(prefix_tokens).unsqueeze(-1)
-    current_keys_q = current_keys.index_select(0, head_to_kv)[:, None]
-    current_values_q = current_values.index_select(0, head_to_kv)[:, None]
-    return (
-        torch.where(current_mask, current_keys_q, selected_keys),
-        torch.where(current_mask, current_values_q, selected_values),
-    )
-
-
-def selected_attention(
-    queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
-    valid_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    return F.scaled_dot_product_attention(
-        queries[None, :, None], keys[None], values[None],
-        attn_mask=None if valid_mask is None else valid_mask[None, :, None],
-        dropout_p=0.0, is_causal=False,
-    )[0, :, 0]
-
-
-def _timed(operation: Callable[[], T], device: torch.device, events: list) -> tuple[T, float]:
-    if device.type == "cuda":
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record(); result = operation(); end.record()
-        events.append((start, end, device))
-        return result, 0.0
-    started = time.perf_counter(); result = operation()
-    return result, (time.perf_counter() - started) * 1000
-
-
-def _finish(events: Sequence) -> float:
-    if not events:
-        return 0.0
-    for device in {x[2] for x in events}:
-        torch.cuda.synchronize(device)
-    return sum(float(start.elapsed_time(end)) for start, end, _ in events)
-
-
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     first, second = x.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
@@ -817,7 +752,7 @@ class LlamaSparseDecoder:
                 )
             elif method == "fier":
                 layers[layer] = build_fier_cache(
-                    keys, group_size=self.retrieval.group_size, reserve_tokens=reserve_tokens,
+                    keys, group_size=TOKEN_GROUP_SIZE, reserve_tokens=reserve_tokens,
                 )
             else:
                 layers[layer] = build_popkv_cache(
@@ -872,6 +807,7 @@ class LlamaSparseDecoder:
                 from popkv_cuda import pack_keys_into
                 pack_keys_into(
                     cache.active_keys, cache.packed, token_offset=cache.sealed_tokens,
+                    token_group_size=cache.group_size,
                     dim_group_size=cache.dim_group_size,
                 )
         timer.mark("k_metadata_encoding")
@@ -972,10 +908,17 @@ class LlamaSparseDecoder:
                 valid = None
                 if method == "quest":
                     assert isinstance(sparse_cache, QuestCache)
-                    scores = quest_scores(q[0, :, 0], sparse_cache, self.head_to_kv)
+                    from sparse_kernels import quest_indices, quest_scores
+                    pages = sparse_cache.sealed_pages + int(sparse_cache.active_keys.shape[1] > 0)
+                    scores = quest_scores(
+                        q[0, :, 0], sparse_cache.page_min, sparse_cache.page_max,
+                        self.head_to_kv, pages=pages,
+                    )
                     timer.mark("score")
-                    indices, valid = quest_indices(scores, num_tokens=num_tokens,
-                        page_size=self.retrieval.quest_page_size, budget=self.retrieval.budget)
+                    indices, valid = quest_indices(
+                        scores, num_tokens=num_tokens, page_size=self.retrieval.quest_page_size,
+                        budget=self.retrieval.budget,
+                    )
                     timer.mark("topk")
                 elif method == "fier":
                     assert isinstance(sparse_cache, FIERCache)
@@ -1001,6 +944,7 @@ class LlamaSparseDecoder:
                         q[0, :, 0].unsqueeze(0).contiguous(), sparse_cache.packed,
                         head_to_kv=self.head_to_kv, tokens=sparse_cache.token_count,
                         dim_group_size=sparse_cache.dim_group_size,
+                        dim_kernel=self.retrieval.dim_kernel,
                     )
                     timer.mark("score")
                     def topk_popkv():
@@ -1014,10 +958,14 @@ class LlamaSparseDecoder:
                 diag.selected_tokens += int(indices.numel())
                 diag.available_tokens += num_tokens * self.num_heads
                 diag.sparse_head_calls += self.num_heads
-                def gather_sparse():
-                    return gather_selected_kv(prefix_k[0], prefix_v[0], k[0, :, 0], v[0, :, 0], indices, self.head_to_kv)
-                selected_k, selected_v = gather_sparse(); timer.mark("gather")
-                output = selected_attention(q[0, :, 0], selected_k, selected_v, valid)
+                # Indexed attention reads selected K/V directly from the cache;
+                # no per-query-head gathered K/V tensor is materialized.
+                timer.mark("gather")
+                from sparse_kernels import indexed_attention
+                output = indexed_attention(
+                    q[0, :, 0], prefix_k[0], prefix_v[0], k[0, :, 0], v[0, :, 0],
+                    indices, self.head_to_kv, valid,
+                )
                 timer.mark("attention")
 
             output = output.reshape(1, 1, -1).to(normalized.dtype)
