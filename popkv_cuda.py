@@ -93,14 +93,14 @@ def update_quest_metadata(active_keys: torch.Tensor, page_min: torch.Tensor, pag
     _extension().quest_update(active_keys, page_min, page_max, int(page))
 
 
-def update_fier_metadata(active_keys: torch.Tensor, packed: torch.Tensor, group_min: torch.Tensor,
+def update_fier_legacy_metadata(active_keys: torch.Tensor, packed: torch.Tensor, group_min: torch.Tensor,
                          group_max: torch.Tensor, *, token_offset: int) -> None:
     if active_keys.ndim != 3 or not active_keys.is_cuda or not active_keys.is_contiguous():
         raise ValueError("active_keys must be contiguous CUDA [KV heads, tokens, head dim]")
-    _extension().fier_update(active_keys, packed, group_min, group_max, int(token_offset))
+    _extension().fier_legacy_update(active_keys, packed, group_min, group_max, int(token_offset))
 
 
-def update_fier_author_metadata(
+def update_fier_metadata(
     active_keys: torch.Tensor,
     packed: torch.Tensor,
     group_zero: torch.Tensor,
@@ -108,15 +108,15 @@ def update_fier_author_metadata(
     *,
     token_offset: int,
 ) -> None:
-    """Update one active g32 word in the authors' word-major cache layout."""
+    """Update one active g32 word in the word-major cache layout."""
     if active_keys.ndim != 3 or not active_keys.is_cuda or not active_keys.is_contiguous():
         raise ValueError("active_keys must be contiguous CUDA [KV heads, tokens, head dim]")
-    _extension().fier_author_update(
+    _extension().fier_update(
         active_keys, packed, group_zero, group_scale, int(token_offset)
     )
 
 
-def score_fier_author(
+def score_fier(
     queries: torch.Tensor,
     packed: torch.Tensor,
     group_zero: torch.Tensor,
@@ -125,10 +125,10 @@ def score_fier_author(
     head_to_kv: torch.Tensor,
     tokens: int,
 ) -> torch.Tensor:
-    """Authors-style fused 1-bit dequantization/GEMV with FP16 scores."""
+    """fused 1-bit dequantization/GEMV with FP16 scores."""
     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
         raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
-    return _extension().fier_author_score(
+    return _extension().fier_score(
         queries,
         packed,
         group_zero,

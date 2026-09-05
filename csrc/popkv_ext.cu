@@ -49,7 +49,7 @@ __global__ void quest_update_kernel(
 }
 
 template <typename scalar_t>
-__global__ void fier_update_kernel(
+__global__ void fier_legacy_update_kernel(
     const scalar_t* __restrict__ keys, int32_t* __restrict__ packed,
     scalar_t* __restrict__ group_min, scalar_t* __restrict__ group_max,
     int64_t tokens, int64_t head_dim, int64_t storage_words,
@@ -977,7 +977,7 @@ void quest_update_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void fier_update_cuda(
+void fier_legacy_update_cuda(
     torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min,
     torch::Tensor group_max, int64_t token_offset) {
     CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
@@ -997,8 +997,8 @@ void fier_update_cuda(
                 group < group_min.size(1), "FIER token offset out of bounds");
     c10::cuda::CUDAGuard guard(keys.device());
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_update_cuda", [&] {
-        fier_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_legacy_update_cuda", [&] {
+        fier_legacy_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
             keys.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
             group_min.data_ptr<scalar_t>(), group_max.data_ptr<scalar_t>(),
             keys.size(1), keys.size(2), packed.size(2), group_min.size(1), word, group);
@@ -1357,11 +1357,11 @@ void popkv_query_encode_out_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// Authors-style FIER layout: one uint32 encodes 32 tokens and head_dim is the
+// FIER layout: one uint32 encodes 32 tokens and head_dim is the
 // contiguous inner dimension, i.e. packed[KVH, token_word, D].  For 1-bit RTN,
 // zero=min and scale=max-min reconstruct the two group representatives.
 template <typename scalar_t>
-__global__ void fier_author_update_kernel(
+__global__ void fier_update_kernel(
     const scalar_t* __restrict__ keys, int32_t* __restrict__ packed,
     scalar_t* __restrict__ group_zero, scalar_t* __restrict__ group_scale,
     int64_t tokens, int64_t head_dim, int64_t storage_words,
@@ -1389,7 +1389,7 @@ __global__ void fier_author_update_kernel(
 }
 
 template <typename scalar_t>
-__global__ void fier_author_score_kernel(
+__global__ void fier_score_kernel(
     const scalar_t* __restrict__ queries,
     const int32_t* __restrict__ packed,
     const scalar_t* __restrict__ group_zero,
@@ -1434,7 +1434,7 @@ __global__ void fier_author_score_kernel(
     }
 }
 
-void fier_author_update_cuda(
+void fier_update_cuda(
     torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero,
     torch::Tensor group_scale, int64_t token_offset) {
     CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
@@ -1442,23 +1442,23 @@ void fier_author_update_cuda(
     CHECK_CUDA(group_zero); CHECK_CUDA(group_scale);
     CHECK_CONTIGUOUS(group_zero); CHECK_CONTIGUOUS(group_scale);
     TORCH_CHECK(keys.dim() == 3 && keys.size(1) > 0 && keys.size(1) <= 32,
-                "active author FIER keys must contain 1..32 tokens");
+                "active FIER keys must contain 1..32 tokens");
     TORCH_CHECK(group_zero.scalar_type() == keys.scalar_type() &&
                 group_scale.scalar_type() == keys.scalar_type(),
-                "author FIER metadata dtype must match keys");
+                "FIER metadata dtype must match keys");
     TORCH_CHECK(packed.dim() == 3 && packed.size(0) == keys.size(0) &&
-                packed.size(2) == keys.size(2), "author FIER packed shape mismatch");
+                packed.size(2) == keys.size(2), "FIER packed shape mismatch");
     TORCH_CHECK(group_zero.sizes() == group_scale.sizes() && group_zero.dim() == 3 &&
                 group_zero.size(0) == keys.size(0) && group_zero.size(2) == keys.size(2),
-                "author FIER metadata shape mismatch");
+                "FIER metadata shape mismatch");
     int64_t word = token_offset / 32, group = word;
     TORCH_CHECK(token_offset >= 0 && token_offset % 32 == 0 &&
                 word < packed.size(1) && group < group_zero.size(1),
-                "author FIER token offset out of bounds");
+                "FIER token offset out of bounds");
     c10::cuda::CUDAGuard guard(keys.device());
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_author_update_cuda", [&] {
-        fier_author_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_update_cuda", [&] {
+        fier_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
             keys.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
             group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
             keys.size(1), keys.size(2), packed.size(1), group_zero.size(1), word, group);
@@ -1466,7 +1466,7 @@ void fier_author_update_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-torch::Tensor fier_author_score_cuda(
+torch::Tensor fier_score_cuda(
     torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
     torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens) {
     CHECK_CUDA(queries); CHECK_CONTIGUOUS(queries); CHECK_FLOATISH(queries);
@@ -1477,14 +1477,14 @@ torch::Tensor fier_author_score_cuda(
     TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
     int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
     TORCH_CHECK(queries.dim() == 3 && packed.dim() == 3 && group_zero.dim() == 3,
-                "invalid author FIER tensor ranks");
+                "invalid FIER tensor ranks");
     TORCH_CHECK(packed.size(2) == head_dim && group_zero.size(2) == head_dim &&
-                group_zero.sizes() == group_scale.sizes(), "author FIER shape mismatch");
+                group_zero.sizes() == group_scale.sizes(), "FIER shape mismatch");
     TORCH_CHECK(group_zero.scalar_type() == queries.scalar_type() &&
                 group_scale.scalar_type() == queries.scalar_type(),
-                "author FIER query/metadata dtype mismatch");
+                "FIER query/metadata dtype mismatch");
     TORCH_CHECK(tokens > 0 && tokens <= packed.size(1) * 32 &&
-                (tokens + 31) / 32 <= group_zero.size(1), "invalid author FIER token count");
+                (tokens + 31) / 32 <= group_zero.size(1), "invalid FIER token count");
     TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
     auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
     int64_t used_words = (tokens + 31) / 32;
@@ -1492,8 +1492,8 @@ torch::Tensor fier_author_score_cuda(
     dim3 threads(32, 4);
     c10::cuda::CUDAGuard guard(queries.device());
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "fier_author_score_cuda", [&] {
-        fier_author_score_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "fier_score_cuda", [&] {
+        fier_score_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
             queries.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
             group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
             head_to_kv.data_ptr<int64_t>(), reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),

@@ -46,7 +46,7 @@ class Profile:
 PROFILES = (
     Profile("Full", "full"),
     Profile("QUEST", "quest", page_size=16),
-    Profile("FIER-author", "fier", token_group=32, fier_kernel="author", score_bytes=2),
+    Profile("FIER", "fier", token_group=32, fier_kernel="fier", score_bytes=2),
     Profile("PopKV-Normal", "popkv", token_group=32, dim_group=32,
             score_kernel="fp16-gqa-tiled", score_bytes=2),
     Profile("PopKV-Q", "popkv", token_group=128, dim_group=16,
@@ -151,7 +151,7 @@ def _score(profile: Profile, shape: ModelShape, prefix_tokens: int) -> Cost:
     if profile.method == "fier":
         blocks = math.ceil(prefix_tokens / 32)
         elements = q * prefix_tokens * dim
-        if profile.fier_kernel == "author":
+        if profile.fier_kernel == "fier":
             # Public-code structure: bit->FP, scale*bit+zero, then FP32 MAC.
             # Scores are FP16; packed words and metadata are D-contiguous.
             flops = 4 * elements
@@ -281,7 +281,7 @@ def _prepack(profile: Profile, shape: ModelShape, tokens: int, sparse_layers: in
         traffic = elements * (2 * d + 2 * d) + metadata
         comparisons = k * dim * (2 * (tokens - groups) + tokens)
         words = math.ceil(tokens / 32)
-        if profile.fier_kernel == "author":
+        if profile.fier_kernel == "fier":
             # The public wrapper converts max to scale in place, then makes the
             # packed [KVH,D,word] result word-major and contiguous.
             metadata_elements = k * groups * dim

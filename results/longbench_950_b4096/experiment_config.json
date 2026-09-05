@@ -1,6 +1,6 @@
 {
   "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
-  "methods": "full,quest,fier-author,popkv-q,popkv-s",
+  "methods": "full,quest,fier,popkv-q,popkv-s",
   "datasets": "qasper,multifieldqa_en,hotpotqa,gov_report,triviaqa",
   "budgets": "4096",
   "samples_per_dataset": 40,
@@ -10,7 +10,7 @@
   "dim_group_size": 32,
   "dim_kernel": "auto",
   "quest_page_size": 16,
-  "fier_kernel": "author",
+  "fier_kernel": "fier",
   "full_layers": "0,1",
   "seed": 42,
   "dtype": "bfloat16",
@@ -37,8 +37,8 @@
       "budget": 4096
     },
     {
-      "method": "fier-author",
-      "label": "fier-author_b4096",
+      "method": "fier",
+      "label": "fier_b4096",
       "budget": 4096
     },
     {

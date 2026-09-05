@@ -6,7 +6,7 @@ Scores are percentages; only completed samples are included. Average is the unwe
 
 | Method | Budget | qasper | multifieldqa_en | hotpotqa | gov_report | triviaqa | Average |
 |---|---|---|---|---|---|---|---|
-| fier-author | 4096 | 46.146 | 53.630 | 56.058 | 19.972 | 91.478 | 53.457 |
+| fier | 4096 | 46.146 | 53.630 | 56.058 | 19.972 | 91.478 | 53.457 |
 | full |  | 45.982 | 53.050 | 55.354 | 19.917 | 91.645 | 53.190 |
 | popkv-q | 4096 | 46.042 | 53.553 | 55.258 | 19.931 | 91.478 | 53.252 |
 | popkv-s | 4096 | 45.602 | 53.929 | 54.891 | 20.042 | 91.469 | 53.187 |
@@ -16,7 +16,7 @@ Scores are percentages; only completed samples are included. Average is the unwe
 
 | Method | Budget | Average | Retention % | Min task % |
 |---|---|---|---|---|
-| fier-author | 4096 | 53.457 | 100.563 | 99.818 |
+| fier | 4096 | 53.457 | 100.563 | 99.818 |
 | full |  | 53.190 | 100.000 | 100.000 |
 | popkv-q | 4096 | 53.252 | 100.158 | 99.818 |
 | popkv-s | 4096 | 53.187 | 100.086 | 99.165 |
@@ -26,11 +26,11 @@ Scores are percentages; only completed samples are included. Average is the unwe
 
 | Method | Budget | Dataset | Decode ms/tok | Search | Attention | Failed |
 |---|---|---|---|---|---|---|
-| fier-author | 4096 | gov_report | 40.191 | 2.828 | 6.381 | 0 |
-| fier-author | 4096 | hotpotqa | 45.518 | 3.880 | 7.899 | 0 |
-| fier-author | 4096 | multifieldqa_en | 44.511 | 3.016 | 6.795 | 0 |
-| fier-author | 4096 | qasper | 43.237 | 2.488 | 6.221 | 0 |
-| fier-author | 4096 | triviaqa | 43.781 | 3.402 | 7.358 | 0 |
+| fier | 4096 | gov_report | 40.191 | 2.828 | 6.381 | 0 |
+| fier | 4096 | hotpotqa | 45.518 | 3.880 | 7.899 | 0 |
+| fier | 4096 | multifieldqa_en | 44.511 | 3.016 | 6.795 | 0 |
+| fier | 4096 | qasper | 43.237 | 2.488 | 6.221 | 0 |
+| fier | 4096 | triviaqa | 43.781 | 3.402 | 7.358 | 0 |
 | full |  | gov_report | 70.589 | 0.000 | 35.764 | 0 |
 | full |  | hotpotqa | 81.396 | 0.000 | 44.781 | 0 |
 | full |  | multifieldqa_en | 56.556 | 0.000 | 23.454 | 0 |

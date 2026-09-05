@@ -2,7 +2,7 @@
   "scores_raw": [
     {
       "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
-      "method": "fier-author",
+      "method": "fier",
       "dataset": "gov_report",
       "budget": 4096,
       "metric": "ROUGE-L",
@@ -17,7 +17,7 @@
     },
     {
       "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
-      "method": "fier-author",
+      "method": "fier",
       "dataset": "hotpotqa",
       "budget": 4096,
       "metric": "F1",
@@ -32,7 +32,7 @@
     },
     {
       "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
-      "method": "fier-author",
+      "method": "fier",
       "dataset": "multifieldqa_en",
       "budget": 4096,
       "metric": "F1",
@@ -47,7 +47,7 @@
     },
     {
       "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
-      "method": "fier-author",
+      "method": "fier",
       "dataset": "qasper",
       "budget": 4096,
       "metric": "F1",
@@ -62,7 +62,7 @@
     },
     {
       "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
-      "method": "fier-author",
+      "method": "fier",
       "dataset": "triviaqa",
       "budget": 4096,
       "metric": "F1",
@@ -378,7 +378,7 @@
   ],
   "scores_summary": [
     {
-      "method": "fier-author",
+      "method": "fier",
       "budget": 4096,
       "task_average": 53.45673052594854,
       "qa_average": 61.82793588952268,
@@ -430,7 +430,7 @@
   ],
   "runtime_summary": [
     {
-      "method": "fier-author",
+      "method": "fier",
       "budget": 4096,
       "dataset": "gov_report",
       "num_success": 200,
@@ -485,7 +485,7 @@
       "avg_search_ms_per_token": 2.8280822636154763
     },
     {
-      "method": "fier-author",
+      "method": "fier",
       "budget": 4096,
       "dataset": "hotpotqa",
       "num_success": 200,
@@ -540,7 +540,7 @@
       "avg_search_ms_per_token": 3.8800228241664816
     },
     {
-      "method": "fier-author",
+      "method": "fier",
       "budget": 4096,
       "dataset": "multifieldqa_en",
       "num_success": 150,
@@ -595,7 +595,7 @@
       "avg_search_ms_per_token": 3.0157589284080952
     },
     {
-      "method": "fier-author",
+      "method": "fier",
       "budget": 4096,
       "dataset": "qasper",
       "num_success": 200,
@@ -650,7 +650,7 @@
       "avg_search_ms_per_token": 2.4879138255192528
     },
     {
-      "method": "fier-author",
+      "method": "fier",
       "budget": 4096,
       "dataset": "triviaqa",
       "num_success": 200,

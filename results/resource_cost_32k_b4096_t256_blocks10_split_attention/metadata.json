@@ -36,12 +36,12 @@
       "score_bytes": 4
     },
     {
-      "label": "FIER-author",
+      "label": "FIER",
       "method": "fier",
       "token_group": 32,
       "dim_group": 0,
       "page_size": 16,
-      "fier_kernel": "author",
+      "fier_kernel": "fier",
       "score_kernel": "legacy",
       "score_bytes": 2
     },

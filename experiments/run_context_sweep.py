@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-DEFAULT_METHODS = "full,quest,fier-author,popkv-q,popkv-s"
+DEFAULT_METHODS = "full,quest,fier,popkv-q,popkv-s"
 
 
 def arguments() -> argparse.Namespace:

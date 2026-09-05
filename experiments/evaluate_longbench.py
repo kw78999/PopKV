@@ -85,7 +85,7 @@ class MethodSpec:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Time-bounded Pop-KV LongBench quality reproduction")
     p.add_argument("--model", default="NousResearch/Meta-Llama-3.1-8B-Instruct")
-    p.add_argument("--methods", default="full,quest,fier-author,popkv-q,popkv-s")
+    p.add_argument("--methods", default="full,quest,fier,popkv-q,popkv-s")
     p.add_argument("--datasets", default=",".join(PROMPTS))
     p.add_argument("--budgets", default="4096")
     p.add_argument("--samples-per-dataset", type=int, default=40)
@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dim-kernel", choices=("auto", "g16", "g32", "g64-u32", "g64-u64"),
                    default="auto", help="specialized PopKV dimension-score kernel")
     p.add_argument("--quest-page-size", type=int, default=16)
-    p.add_argument("--fier-kernel", choices=("author",), default="author")
+    p.add_argument("--fier-kernel", choices=("fier",), default="fier")
     p.add_argument("--full-layers", default="0,1")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -260,7 +260,7 @@ def load_samples(tokenizer: Any, args: argparse.Namespace, datasets: tuple[str, 
 
 def method_specs(
     methods: tuple[str, ...], budgets: tuple[int, ...], group: int, dim_group: int,
-    dim_kernel: str, page: int, fier_kernel: str = "author",
+    dim_kernel: str, page: int, fier_kernel: str = "fier",
 ) -> list[MethodSpec]:
     del group, dim_group, dim_kernel, fier_kernel
     result: list[MethodSpec] = []
@@ -279,7 +279,7 @@ def retrieval_for(args: argparse.Namespace, spec: MethodSpec) -> RetrievalConfig
         budget=spec.budget or max(int_tuple(args.budgets)),
         quest_page_size=args.quest_page_size,
         full_layers=int_tuple(args.full_layers),
-        fier_kernel="author",
+        fier_kernel="fier",
     )
 
 
@@ -625,7 +625,7 @@ def validate_short(decoder: LlamaSparseDecoder, tokenizer: Any, sample: Sample, 
     manual = generate_one(decoder, tokenizer, short, MethodSpec("full", "full", None), base, 0.0)["output_ids"]
     if manual != hf_ids[:len(manual)]:
         raise AssertionError(f"HF/manual Full mismatch: hf={hf_ids} manual={manual}")
-    for method in ("quest", "fier-author", "popkv-q", "popkv-s"):
+    for method in ("quest", "fier", "popkv-q", "popkv-s"):
         spec = MethodSpec(method, f"validate_{method}", len(ids) + 8)
         decoder.retrieval = retrieval_for(args, spec)
         result = generate_one(decoder, tokenizer, short, spec, base, 0.0)
@@ -734,7 +734,7 @@ def main() -> None:
                 "full": .34,
                 "quest": .82,
                 "fier": .52,
-                "fier-author": .52,
+                "fier": .52,
                 "popkv": .50,
                 "popkv-normal": .50,
                 "popkv-q": .50,

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PG = ROOT / 'results/five_methods_split_attention_32k_b4096_t256_blocks10'
 LB = ROOT / 'results/longbench_950_b4096'
 TASK_COUNTS = {'qasper': 200, 'multifieldqa_en': 150, 'hotpotqa': 200, 'gov_report': 200, 'triviaqa': 200}
-METHODS = {'full', 'quest', 'fier-author', 'popkv-q', 'popkv-s'}
+METHODS = {'full', 'quest', 'fier', 'popkv-q', 'popkv-s'}
 
 
 def csv_rows(path):

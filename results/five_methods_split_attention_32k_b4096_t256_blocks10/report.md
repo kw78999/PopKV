@@ -8,7 +8,7 @@ Llama-3.1-8B; context 32,768; budget 4,096; 10 blocks × 256 evaluated tokens; B
 |---|---:|---:|---:|
 | Full | 11.1416 | 170.742 | 5.857 |
 | QUEST | 13.8755 | 42.157 | 23.721 |
-| FIER-author | 11.1880 | 45.581 | 21.939 |
+| FIER | 11.1880 | 45.581 | 21.939 |
 | PopKV-Q | 11.2354 | 43.888 | 22.785 |
 | PopKV-S | 11.2626 | 43.011 | 23.250 |
 
@@ -16,7 +16,7 @@ Llama-3.1-8B; context 32,768; budget 4,096; 10 blocks × 256 evaluated tokens; B
 
 Each component is exclusive. Total = score + Top-k + attention + other model operations + decode timing remainder + next-token selection + cache update.
 
-| Stage (ms/token) | Full | QUEST | FIER-author | PopKV-Q | PopKV-S |
+| Stage (ms/token) | Full | QUEST | FIER | PopKV-Q | PopKV-S |
 |---|---:|---:|---:|---:|---:|
 | Score (query preparation + scoring) | 0.000 | 1.006 | 3.227 | 1.365 | 0.813 |
 | Top-k retrieval | 0.000 | 0.882 | 1.844 | 1.814 | 1.769 |
@@ -38,7 +38,7 @@ Prefix prefill and one-time metadata prepack are outside this decode-cycle total
 
 ## Decode stages (including timing remainders)
 
-| Stage (ms/token) | Full | QUEST | FIER-author | PopKV-Q | PopKV-S |
+| Stage (ms/token) | Full | QUEST | FIER | PopKV-Q | PopKV-S |
 |---|---:|---:|---:|---:|---:|
 | Frontend | 0.383 | 0.359 | 0.361 | 0.355 | 0.356 |
 | QKV + RoPE | 4.675 | 4.561 | 4.580 | 4.552 | 4.533 |
@@ -58,7 +58,7 @@ Prefix prefill and one-time metadata prepack are outside this decode-cycle total
 
 ## Cache-update stages
 
-| Stage (ms/token) | Full | QUEST | FIER-author | PopKV-Q | PopKV-S |
+| Stage (ms/token) | Full | QUEST | FIER | PopKV-Q | PopKV-S |
 |---|---:|---:|---:|---:|---:|
 | Static KV update | 0.649 | 0.650 | 0.660 | 0.642 | 0.650 |
 | Active-key staging | 0.000 | 0.402 | 0.410 | 0.414 | 0.417 |

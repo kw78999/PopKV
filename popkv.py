@@ -13,7 +13,7 @@ from typing import Any, Sequence
 import torch
 import torch.nn.functional as F
 
-METHODS = ("full", "quest", "fier-author", "popkv-normal", "popkv-q", "popkv-s")
+METHODS = ("full", "quest", "fier", "popkv-normal", "popkv-q", "popkv-s")
 
 POPKV_PRESETS = {
     "popkv-normal": (32, 32),
@@ -36,7 +36,7 @@ class RetrievalConfig:
     dim_group_size: int = 32  # dimensions sharing low/delta representatives (G_dim)
     dim_kernel: str = "auto"  # specialized score kernel; auto follows G_dim
     quest_page_size: int = 16
-    fier_kernel: str = "author"
+    fier_kernel: str = "fier"
     full_layers: tuple[int, ...] = (0, 1)
 
     def validate(self) -> None:
@@ -58,8 +58,8 @@ class RetrievalConfig:
                 )
         if self.quest_page_size <= 0:
             raise ValueError("quest_page_size must be positive")
-        if self.fier_kernel != "author":
-            raise ValueError("the public FIER method is fixed to the authors implementation")
+        if self.fier_kernel != "fier":
+            raise ValueError("the public FIER method is fixed to the FIER implementation")
 
 
 @dataclass
@@ -82,7 +82,7 @@ class FIERCache:
     group_max: torch.Tensor
     active_keys: torch.Tensor
 
-    implementation: str = "author"
+    implementation: str = "fier"
 
 @dataclass
 class PopKVCache:
@@ -339,7 +339,7 @@ def append_quest(
 
 def build_fier_cache(
     keys: torch.Tensor, *, group_size: int, reserve_tokens: int,
-    implementation: str = "author",
+    implementation: str = "fier",
 ) -> FIERCache:
     from fier_triton import pack_keys
 
@@ -350,7 +350,7 @@ def build_fier_cache(
     capacity = math.ceil((tokens + reserve_tokens) / group_size) * group_size
     words = math.ceil(capacity / 32)
     packed_shape = (
-        (kv_heads, words, dim) if implementation == "author"
+        (kv_heads, words, dim) if implementation == "fier"
         else (kv_heads, dim, words)
     )
     packed_storage = torch.empty(
@@ -360,7 +360,7 @@ def build_fier_cache(
         (kv_heads, math.ceil(capacity / group_size), dim), device=keys.device, dtype=mins.dtype,
     )
     max_storage = torch.empty_like(min_storage)
-    if implementation == "author":
+    if implementation == "fier":
         packed_storage[:, : packed.shape[1], :].copy_(packed)
     else:
         packed_storage[:, :, : packed.shape[2]].copy_(packed)
@@ -376,15 +376,15 @@ def build_fier_cache(
 
 
 def write_fier_active(cache: FIERCache) -> None:
-    if cache.implementation == "author":
-        from popkv_cuda import update_fier_author_metadata
-        update_fier_author_metadata(
+    if cache.implementation == "fier":
+        from popkv_cuda import update_fier_metadata
+        update_fier_metadata(
             cache.active_keys, cache.packed, cache.group_min, cache.group_max,
             token_offset=cache.sealed_tokens,
         )
     else:
-        from popkv_cuda import update_fier_metadata
-        update_fier_metadata(
+        from popkv_cuda import update_fier_legacy_metadata
+        update_fier_legacy_metadata(
             cache.active_keys, cache.packed, cache.group_min, cache.group_max,
             token_offset=cache.sealed_tokens,
         )
@@ -820,10 +820,10 @@ class LlamaSparseDecoder:
                 layers[layer] = build_quest_cache(
                     keys, page_size=self.retrieval.quest_page_size, reserve_tokens=reserve_tokens,
                 )
-            elif method == "fier-author":
+            elif method == "fier":
                 layers[layer] = build_fier_cache(
                     keys, group_size=TOKEN_GROUP_SIZE, reserve_tokens=reserve_tokens,
-                    implementation="author",
+                    implementation="fier",
                 )
             else:
                 try:
@@ -1002,7 +1002,7 @@ class LlamaSparseDecoder:
                         budget=self.retrieval.budget,
                     )
                     timer.mark("topk")
-                elif method == "fier-author":
+                elif method == "fier":
                     assert isinstance(sparse_cache, FIERCache)
                     from fier_triton import score_packed_batched
                     def score_fier():
@@ -1010,7 +1010,7 @@ class LlamaSparseDecoder:
                             q[0, :, 0].unsqueeze(0), sparse_cache.packed,
                             sparse_cache.group_min, sparse_cache.group_max,
                             self.head_to_kv, tokens=prefix_length, group_size=sparse_cache.group_size,
-                            implementation="author",
+                            implementation="fier",
                         )
                     scores = score_fier(); timer.mark("retrieval_score")
                     def topk_fier():

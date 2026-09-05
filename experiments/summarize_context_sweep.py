@@ -7,11 +7,11 @@ import csv
 from pathlib import Path
 
 
-METHODS = ("full", "quest", "fier-author", "popkv-q", "popkv-s")
+METHODS = ("full", "quest", "fier", "popkv-q", "popkv-s")
 METHOD_LABELS = {
     "full": "Full",
     "quest": "Quest (GQA fused)",
-    "fier-author": "FIER-author",
+    "fier": "FIER",
     "popkv-q": "PopKV-Q",
     "popkv-s": "PopKV-S",
 }
@@ -93,7 +93,7 @@ def main() -> None:
         else:
             if "quest" in latest:
                 selected["quest"] = (latest["quest"], "latest_quest_gqa_fused")
-            for method in ("full", "fier-author", "popkv-q", "popkv-s"):
+            for method in ("full", "fier", "popkv-q", "popkv-s"):
                 if method in previous:
                     selected[method] = (previous[method], "previous_multi_method")
 
@@ -161,7 +161,7 @@ def main() -> None:
         "",
         "Configuration: Llama-3.1-8B, budget 4096, 4 PG19 blocks, 256 evaluated tokens per block, seed 42.",
         "",
-        "Source policy: 4–31K uses the new low-context multi-method sweep. From 32K onward, Quest uses the latest GQA-fused sweep while Full, FIER-author, PopKV-Q, and PopKV-S use the earlier multi-method sweep. Results with fewer than 1024 evaluated tokens are excluded. One-block experiments are not mixed into this table.",
+        "Source policy: 4–31K uses the new low-context multi-method sweep. From 32K onward, Quest uses the latest GQA-fused sweep while Full, FIER, PopKV-Q, and PopKV-S use the earlier multi-method sweep. Results with fewer than 1024 evaluated tokens are excluded. One-block experiments are not mixed into this table.",
         "",
         f"Coverage: {coverage_text}.",
         "",

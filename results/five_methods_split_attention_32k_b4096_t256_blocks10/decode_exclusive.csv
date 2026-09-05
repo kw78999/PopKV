@@ -25,19 +25,19 @@ QUEST,MLP,17.700526861613618
 QUEST,Final norm + LM head,1.5092050373088568
 QUEST,GPU timing remainder,0.009321292607637588
 QUEST,Host decode remainder,0.47910298218776004
-FIER-author,Frontend,0.3606754123000428
-FIER-author,QKV + RoPE,4.579601252014982
-FIER-author,Score (query preparation + scoring),3.22702527543006
-FIER-author,Top-k retrieval,1.843799726072757
-FIER-author,Full K/V concatenation,1.1718628257047385
-FIER-author,Full attention,7.588258373364806
-FIER-author,Sparse attention partial,3.617614987262641
-FIER-author,Sparse attention merge,0.14342878835159353
-FIER-author,Output projection,1.872724536698661
-FIER-author,MLP,17.735481477249415
-FIER-author,Final norm + LM head,1.5095169499050827
-FIER-author,GPU timing remainder,0.009445776640495751
-FIER-author,Host decode remainder,0.4876353591142106
+FIER,Frontend,0.3606754123000428
+FIER,QKV + RoPE,4.579601252014982
+FIER,Score (query preparation + scoring),3.22702527543006
+FIER,Top-k retrieval,1.843799726072757
+FIER,Full K/V concatenation,1.1718628257047385
+FIER,Full attention,7.588258373364806
+FIER,Sparse attention partial,3.617614987262641
+FIER,Sparse attention merge,0.14342878835159353
+FIER,Output projection,1.872724536698661
+FIER,MLP,17.735481477249415
+FIER,Final norm + LM head,1.5095169499050827
+FIER,GPU timing remainder,0.009445776640495751
+FIER,Host decode remainder,0.4876353591142106
 PopKV-Q,Frontend,0.3545703502604738
 PopKV-Q,QKV + RoPE,4.552141788782319
 PopKV-Q,Score (query preparation + scoring),1.364753487096459

@@ -51,7 +51,7 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--dim-kernel", choices=("auto", "g16", "g32", "g64-u32", "g64-u64"),
                    default="auto", help="specialized PopKV dimension-score kernel")
     p.add_argument("--quest-page-size", type=int, default=16)
-    p.add_argument("--fier-kernel", choices=("author",), default="author")
+    p.add_argument("--fier-kernel", choices=("fier",), default="fier")
     p.add_argument("--full-layers", default="0,1")
     p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     p.add_argument("--device-map", default="auto")

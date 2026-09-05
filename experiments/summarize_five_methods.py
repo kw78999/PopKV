@@ -7,7 +7,7 @@ import math
 from decimal import Decimal
 from pathlib import Path
 
-METHODS = (("full", "Full"), ("quest", "QUEST"), ("fier-author", "FIER-author"),
+METHODS = (("full", "Full"), ("quest", "QUEST"), ("fier", "FIER"),
            ("popkv-normal", "PopKV-Normal"), ("popkv-q", "PopKV-Q"), ("popkv-s", "PopKV-S"))
 DECODE_STAGES = (
     ("frontend", "Frontend"), ("qkv_rope", "QKV + RoPE"),

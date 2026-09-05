@@ -38,7 +38,7 @@ class PopKVTests(unittest.TestCase):
     def test_public_methods_include_normal_ablation(self) -> None:
         self.assertEqual(
             METHODS,
-            ("full", "quest", "fier-author", "popkv-normal", "popkv-q", "popkv-s"),
+            ("full", "quest", "fier", "popkv-normal", "popkv-q", "popkv-s"),
         )
 
     def test_sparse_methods_skip_configured_full_layers(self) -> None:
@@ -51,7 +51,7 @@ class PopKVTests(unittest.TestCase):
 
     def test_release_configuration_is_explicit(self) -> None:
         RetrievalConfig().validate()
-        RetrievalConfig(fier_kernel="author").validate()
+        RetrievalConfig(fier_kernel="fier").validate()
         for size in (8, 16, 32, 64, 128):
             RetrievalConfig(group_size=size).validate()
         RetrievalConfig(group_size=5).validate()
@@ -117,7 +117,7 @@ class PopKVTests(unittest.TestCase):
             torch.testing.assert_close(cached, direct, atol=0, rtol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-    def test_fier_author_matches_its_affine_1bit_reference_and_active_update(self) -> None:
+    def test_fier_matches_its_affine_1bit_reference_and_active_update(self) -> None:
         from fier_triton import pack_keys, score_packed_batched, score_tensors
 
         torch.manual_seed(711)
@@ -125,11 +125,11 @@ class PopKVTests(unittest.TestCase):
         query = torch.randn(1, 8, 128, device="cuda", dtype=torch.float16)
         mapping = torch.arange(8, device="cuda") // 4
         packed, zero, scale = pack_keys(
-            keys.contiguous(), group_size=32, implementation="author",
+            keys.contiguous(), group_size=32, implementation="fier",
         )
         actual = score_packed_batched(
             query, packed, zero, scale, mapping, tokens=31, group_size=32,
-            implementation="author",
+            implementation="fier",
         )
         shifts = torch.arange(32, device="cuda", dtype=torch.int64)
         bits = ((packed.to(torch.int64).unsqueeze(2) >> shifts[None, None, :, None]) & 1)
@@ -138,12 +138,12 @@ class PopKVTests(unittest.TestCase):
         expected = torch.einsum("bhd,htd->bht", query.float(), dequant.index_select(0, mapping)).half()
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-3)
 
-        cache = build_fier_cache(keys, group_size=32, reserve_tokens=4, implementation="author")
+        cache = build_fier_cache(keys, group_size=32, reserve_tokens=4, implementation="fier")
         current = torch.randn(2, 1, 128, device="cuda", dtype=torch.float16)
         append_fier(cache, current); keys = torch.cat([keys, current], dim=1)
         cached = score_packed_batched(query, cache.packed, cache.group_min, cache.group_max,
-            mapping, tokens=32, group_size=32, implementation="author")
-        direct = score_tensors(query, keys, head_to_kv=mapping, group_size=32, implementation="author")
+            mapping, tokens=32, group_size=32, implementation="fier")
+        direct = score_tensors(query, keys, head_to_kv=mapping, group_size=32, implementation="fier")
         torch.testing.assert_close(cached, direct, atol=0, rtol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

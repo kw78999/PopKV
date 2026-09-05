@@ -9,3 +9,5 @@ The retained five-task results were measured in the August 2026 experiment and r
 The model revision recorded by the run is `d10aef7999a2b5ba950ab3974312feeedbfe0b77`. A tokenizer revision was not captured. The measurements use Llama-3.1-8B-Instruct with a 32,768-token prompt-truncation setting before chat-template application.
 
 All published means are recomputed from the retained raw records. No model inference was performed during this release cleanup. Use the root README command to run a new evaluation; exact wall times depend on the runtime environment.
+
+FIER labels and implementation identifiers are normalized to the release naming throughout the records and reference patch. Numerical measurements are unchanged. Use the shipped source files rather than applying this normalized reference patch verbatim to the historical tree.

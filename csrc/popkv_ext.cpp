@@ -1,9 +1,9 @@
 #include <torch/extension.h>
 
 void quest_update_cuda(torch::Tensor keys, torch::Tensor page_min, torch::Tensor page_max, int64_t page);
-void fier_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min, torch::Tensor group_max, int64_t token_offset);
-void fier_author_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero, torch::Tensor group_scale, int64_t token_offset);
-torch::Tensor fier_author_score_cuda(
+void fier_legacy_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min, torch::Tensor group_max, int64_t token_offset);
+void fier_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero, torch::Tensor group_scale, int64_t token_offset);
+torch::Tensor fier_score_cuda(
     torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
     torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens);
 std::vector<torch::Tensor> popkv_pack_cuda(
@@ -38,9 +38,9 @@ torch::Tensor popkv_score_encoded_cuda(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quest_update", &quest_update_cuda);
+    m.def("fier_legacy_update", &fier_legacy_update_cuda);
     m.def("fier_update", &fier_update_cuda);
-    m.def("fier_author_update", &fier_author_update_cuda);
-    m.def("fier_author_score", &fier_author_score_cuda);
+    m.def("fier_score", &fier_score_cuda);
     m.def("pack", &popkv_pack_cuda);
     m.def("pack_into", &popkv_pack_into_cuda);
     m.def("score", &popkv_score_cuda);

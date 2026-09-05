@@ -11,7 +11,7 @@
   "dim_group_size": 32,
   "dim_kernel": "auto",
   "quest_page_size": 16,
-  "fier_kernel": "author",
+  "fier_kernel": "fier",
   "full_layers": "0,1",
   "dtype": "bfloat16",
   "device_map": "auto",
@@ -31,7 +31,7 @@
     "dim_group_size": 32,
     "dim_kernel": "auto",
     "quest_page_size": 16,
-    "fier_kernel": "author",
+    "fier_kernel": "fier",
     "full_layers": [
       0,
       1

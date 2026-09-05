@@ -12,7 +12,7 @@ PopKV encodes query/key retrieval metadata as sign and magnitude bit planes, ran
 |---|---|---:|---:|
 | Full | Dense attention | — | — |
 | QUEST | Page min/max bounds; page size 16 | — | — |
-| FIER-author | Sequence-grouped one-bit retrieval | 32 | — |
+| FIER | Sequence-grouped one-bit retrieval | 32 | — |
 | PopKV-Q | Popcount retrieval; quality preset | 128 | 16 |
 | PopKV-S | Popcount retrieval; speed preset | 64 | 64 |
 
@@ -51,7 +51,7 @@ PG19 PPL is sampled next-token PPL from fixed blocks. Latency is the measured de
 |---|---:|---:|---:|
 | Full | 11.1416 | 170.742 | 5.857 |
 | QUEST | 13.8755 | 42.157 | 23.721 |
-| FIER-author | 11.1880 | 45.581 | 21.939 |
+| FIER | 11.1880 | 45.581 | 21.939 |
 | PopKV-Q | 11.2354 | 43.888 | 22.785 |
 | PopKV-S | 11.2626 | 43.011 | 23.250 |
 
@@ -59,7 +59,7 @@ PG19 PPL is sampled next-token PPL from fixed blocks. Latency is the measured de
 
 Each column below is one method. **Add the component rows to obtain the total at the bottom.** All times are ms/token, averaged over the same 2,560 evaluated tokens per method.
 
-| Stage (ms/token) | Full | QUEST | FIER-author | PopKV-Q | PopKV-S |
+| Stage (ms/token) | Full | QUEST | FIER | PopKV-Q | PopKV-S |
 |---|---:|---:|---:|---:|---:|
 | Score (query preparation + scoring) | 0.000 | 1.006 | 3.227 | 1.365 | 0.813 |
 | Top-k retrieval | 0.000 | 0.882 | 1.844 | 1.814 | 1.769 |
@@ -82,9 +82,9 @@ Prefix prefill and one-time metadata prepack are outside this decode-cycle total
 
 ### Score-time comparison
 
-FIER-author takes **3.227 ms/token** for score, compared with **1.365** for PopKV-Q and **0.813** for PopKV-S: **2.36×** and **3.97×** faster score stages (57.7% and 74.8% less time). QUEST takes **1.006 ms/token**, placing PopKV-Q above QUEST and PopKV-S below it. These are score-stage comparisons; end-to-end gains also depend on Top-k, attention, model operations, and cache updates.
+FIER takes **3.227 ms/token** for score, compared with **1.365** for PopKV-Q and **0.813** for PopKV-S: **2.36×** and **3.97×** faster score stages (57.7% and 74.8% less time). QUEST takes **1.006 ms/token**, placing PopKV-Q above QUEST and PopKV-S below it. These are score-stage comparisons; end-to-end gains also depend on Top-k, attention, model operations, and cache updates.
 
-PopKV-Q/S achieve approximately **3.89× / 3.97×** Full's token-generation throughput in this run. QUEST has the shortest total time; FIER-author has the lowest sparse-method PPL.
+PopKV-Q/S achieve approximately **3.89× / 3.97×** Full's token-generation throughput in this run. QUEST has the shortest total time; FIER has the lowest sparse-method PPL.
 
 [Detailed additive decode/update tables](results/five_methods_split_attention_32k_b4096_t256_blocks10/report.md) · [Full-precision timing components](results/five_methods_split_attention_32k_b4096_t256_blocks10/generation_breakdown.csv) · [Closure checks](results/five_methods_split_attention_32k_b4096_t256_blocks10/latency_closure.csv)
 
@@ -93,7 +93,7 @@ PopKV-Q/S achieve approximately **3.89× / 3.97×** Full's token-generation thro
 ```bash
 python -m experiments.evaluate_pg19 \
   --model meta-llama/Llama-3.1-8B \
-  --methods full,quest,fier-author,popkv-q,popkv-s \
+  --methods full,quest,fier,popkv-q,popkv-s \
   --context-length 32768 --budget 4096 \
   --generate-tokens 256 --num-blocks 10 --seed 42 \
   --dtype bfloat16 --attention sdpa --full-layers 0,1 \
@@ -121,7 +121,7 @@ The [4–128K report](results/context_sweep_4k_128k_final/report.md) uses **4 bl
 |---|---:|---|
 | Full | 37 / 125 | 4–40K |
 | QUEST | 125 / 125 | 4–128K |
-| FIER-author, PopKV-Q, PopKV-S | 122 / 125 each | 4–125K |
+| FIER, PopKV-Q, PopKV-S | 122 / 125 each | 4–125K |
 
 At 32K and above, QUEST comes from a later GQA-fused run; other methods come from the earlier multi-method run. Missing measurements stay blank. No Full-relative speedup is reported where Full has no complete measurement. Block boundaries change with context length, so length-wise PPL differences also reflect changes in evaluated tokens.
 
@@ -137,7 +137,7 @@ The release evaluates all valid samples of five selected tasks: Qasper (200), Mu
 |---|---:|---:|---:|---:|---:|---:|
 | Full | 45.982 | 53.050 | 55.354 | 19.917 | 91.645 | 53.190 |
 | QUEST | 47.277 | 53.550 | 55.369 | 20.111 | 89.669 | 53.195 |
-| FIER-author | 46.146 | 53.630 | 56.058 | 19.972 | 91.478 | 53.457 |
+| FIER | 46.146 | 53.630 | 56.058 | 19.972 | 91.478 | 53.457 |
 | PopKV-Q | 46.042 | 53.553 | 55.258 | 19.931 | 91.478 | 53.252 |
 | PopKV-S | 45.602 | 53.929 | 54.891 | 20.042 | 91.469 | 53.187 |
 
@@ -150,7 +150,7 @@ The retained predictions are unchanged historical measurements, reaggregated for
 ```bash
 python -m experiments.evaluate_longbench \
   --model NousResearch/Meta-Llama-3.1-8B-Instruct \
-  --methods full,quest,fier-author,popkv-q,popkv-s \
+  --methods full,quest,fier,popkv-q,popkv-s \
   --datasets qasper,multifieldqa_en,hotpotqa,gov_report,triviaqa \
   --budgets 4096 --all-samples --max-context 32768 \
   --dtype bfloat16 --device-map cuda:0 --attention sdpa \

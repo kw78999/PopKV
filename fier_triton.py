@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Triton kernels for FIER's group-wise 1-bit key retrieval.
 
-The layout follows the FIER authors' public implementation: keys are grouped
+The layout follows the FIER public implementation: keys are grouped
 along the token axis, quantized with per-channel min/max metadata, and packed
 32-to-1 before a fused dequantization/GEMV kernel.  This implementation adds
 partial-group handling and GQA head mapping needed by this evaluator.
@@ -94,21 +94,21 @@ def _validate_keys(keys: torch.Tensor, group_size: int) -> None:
 
 
 def pack_keys(
-    keys: torch.Tensor, *, group_size: int, implementation: str = "author"
+    keys: torch.Tensor, *, group_size: int, implementation: str = "fier"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack authors-style FIER keys as [KVH, token_word, D]."""
+    """Pack FIER keys as [KVH, token_word, D]."""
 
     keys = keys.contiguous()
     _validate_keys(keys, int(group_size))
-    if implementation != "author":
-        raise ValueError("only the FIER authors implementation is public")
-    if implementation == "author" and group_size != 32:
-        raise ValueError("authors-style FIER requires group_size=32")
+    if implementation != "fier":
+        raise ValueError("only the FIER implementation is public")
+    if implementation == "fier" and group_size != 32:
+        raise ValueError("FIER requires group_size=32")
     kv_heads, tokens, head_dim = (int(v) for v in keys.shape)
     num_groups = math.ceil(tokens / group_size)
     words = math.ceil(tokens / 32)
     metadata_shape = (kv_heads, num_groups, head_dim)
-    # Match the authors’ cache layout: min/max metadata uses the source key
+    # Match the FIER cache layout: min/max metadata uses the source key
     # dtype. Group extrema are source values, so this does not add quantization error.
     mins = torch.empty(metadata_shape, device=keys.device, dtype=keys.dtype)
     maxs = torch.empty_like(mins)
@@ -141,7 +141,7 @@ def pack_keys(
             num_warps=1,
         )
     packed = packed.transpose(1, 2).contiguous()
-    maxs.sub_(mins)  # Author notation: zero=min, scale=max-min.
+    maxs.sub_(mins)  # FIER notation: zero=min, scale=max-min.
     return packed, mins, maxs
 
 
@@ -154,31 +154,31 @@ def score_packed_batched(
     *,
     tokens: int,
     group_size: int,
-    implementation: str = "author",
+    implementation: str = "fier",
 ) -> torch.Tensor:
-    """Authors-style fused 1-bit dequantization/GEMV for [B,QH,D]."""
-    if implementation != "author":
-        raise ValueError("only the FIER authors implementation is public")
+    """fused 1-bit dequantization/GEMV for [B,QH,D]."""
+    if implementation != "fier":
+        raise ValueError("only the FIER implementation is public")
     if group_size != 32:
-        raise ValueError("FIER-author requires group_size=32")
+        raise ValueError("FIER requires group_size=32")
     if queries.ndim != 3 or packed.ndim != 3:
         raise ValueError("queries and packed keys must be rank 3")
     if not queries.is_cuda or queries.device != packed.device:
         raise RuntimeError("all FIER tensors must share a CUDA device")
     _, q_heads, head_dim = (int(v) for v in queries.shape)
     if int(packed.shape[2]) != head_dim:
-        raise ValueError("authors-style packed key must be [KVH, words, head_dim]")
+        raise ValueError("packed key must be [KVH, words, head_dim]")
     if zero.shape != scale.shape or zero.ndim != 3:
-        raise ValueError("authors-style zero/scale tensors must have matching shapes")
+        raise ValueError("zero/scale tensors must have matching shapes")
     expected_groups = math.ceil(tokens / group_size)
     if tokens <= 0 or tokens > int(packed.shape[1]) * 32:
-        raise ValueError("tokens is inconsistent with authors-style packed storage")
+        raise ValueError("tokens is inconsistent with packed storage")
     if int(zero.shape[0]) != int(packed.shape[0]) or int(zero.shape[1]) < expected_groups:
-        raise ValueError("authors-style metadata capacity is inconsistent with tokens")
+        raise ValueError("metadata capacity is inconsistent with tokens")
     if int(zero.shape[2]) != head_dim or head_to_kv.numel() != q_heads:
-        raise ValueError("authors-style head dimensions or mapping are inconsistent")
-    from popkv_cuda import score_fier_author
-    return score_fier_author(
+        raise ValueError("head dimensions or mapping are inconsistent")
+    from popkv_cuda import score_fier
+    return score_fier(
         queries.contiguous(), packed, zero, scale,
         head_to_kv=head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous(),
         tokens=tokens,
@@ -191,7 +191,7 @@ def score_tensors(
     *,
     head_to_kv: torch.Tensor,
     group_size: int,
-    implementation: str = "author",
+    implementation: str = "fier",
 ) -> torch.Tensor:
     packed, mins, maxs = pack_keys(keys, group_size=group_size, implementation=implementation)
     return score_packed_batched(

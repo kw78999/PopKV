@@ -39,7 +39,7 @@ For a new sweep with the current code:
 python -m experiments.run_context_sweep \
   --context-start-k 4 --context-end-k 128 --context-step-k 1 \
   --model meta-llama/Llama-3.1-8B \
-  --methods full,quest,fier-author,popkv-q,popkv-s \
+  --methods full,quest,fier,popkv-q,popkv-s \
   --budget 4096 --num-blocks 4 --generate-tokens 256 \
   --prefill-chunk-size 8192 --seed 42 \
   --output-root outputs/new_context_sweep

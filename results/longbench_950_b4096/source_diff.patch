@@ -5,9 +5,9 @@ index 79ebdc4..9a82bcf 100644
 @@ -2,6 +2,10 @@
  
  void quest_update_cuda(torch::Tensor keys, torch::Tensor page_min, torch::Tensor page_max, int64_t page);
- void fier_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min, torch::Tensor group_max, int64_t token_offset);
-+void fier_author_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero, torch::Tensor group_scale, int64_t token_offset);
-+torch::Tensor fier_author_score_cuda(
+ void fier_legacy_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min, torch::Tensor group_max, int64_t token_offset);
++void fier_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero, torch::Tensor group_scale, int64_t token_offset);
++torch::Tensor fier_score_cuda(
 +    torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
 +    torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens);
  std::vector<torch::Tensor> popkv_pack_cuda(
@@ -24,9 +24,9 @@ index 79ebdc4..9a82bcf 100644
  
  PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
      m.def("quest_update", &quest_update_cuda);
-     m.def("fier_update", &fier_update_cuda);
-+    m.def("fier_author_update", &fier_author_update_cuda);
-+    m.def("fier_author_score", &fier_author_score_cuda);
+     m.def("fier_legacy_update", &fier_legacy_update_cuda);
++    m.def("fier_update", &fier_update_cuda);
++    m.def("fier_score", &fier_score_cuda);
      m.def("pack", &popkv_pack_cuda);
      m.def("pack_into", &popkv_pack_into_cuda);
      m.def("score", &popkv_score_cuda);
@@ -361,11 +361,11 @@ index 1fcbe1a..3fea778 100644
      C10_CUDA_KERNEL_LAUNCH_CHECK();
  }
 +
-+// Authors-style FIER layout: one uint32 encodes 32 tokens and head_dim is the
++// FIER layout: one uint32 encodes 32 tokens and head_dim is the
 +// contiguous inner dimension, i.e. packed[KVH, token_word, D].  For 1-bit RTN,
 +// zero=min and scale=max-min reconstruct the two group representatives.
 +template <typename scalar_t>
-+__global__ void fier_author_update_kernel(
++__global__ void fier_update_kernel(
 +    const scalar_t* __restrict__ keys, int32_t* __restrict__ packed,
 +    scalar_t* __restrict__ group_zero, scalar_t* __restrict__ group_scale,
 +    int64_t tokens, int64_t head_dim, int64_t storage_words,
@@ -393,7 +393,7 @@ index 1fcbe1a..3fea778 100644
 +}
 +
 +template <typename scalar_t>
-+__global__ void fier_author_score_kernel(
++__global__ void fier_score_kernel(
 +    const scalar_t* __restrict__ queries,
 +    const int32_t* __restrict__ packed,
 +    const scalar_t* __restrict__ group_zero,
@@ -438,7 +438,7 @@ index 1fcbe1a..3fea778 100644
 +    }
 +}
 +
-+void fier_author_update_cuda(
++void fier_update_cuda(
 +    torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero,
 +    torch::Tensor group_scale, int64_t token_offset) {
 +    CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
@@ -446,23 +446,23 @@ index 1fcbe1a..3fea778 100644
 +    CHECK_CUDA(group_zero); CHECK_CUDA(group_scale);
 +    CHECK_CONTIGUOUS(group_zero); CHECK_CONTIGUOUS(group_scale);
 +    TORCH_CHECK(keys.dim() == 3 && keys.size(1) > 0 && keys.size(1) <= 32,
-+                "active author FIER keys must contain 1..32 tokens");
++                "active FIER keys must contain 1..32 tokens");
 +    TORCH_CHECK(group_zero.scalar_type() == keys.scalar_type() &&
 +                group_scale.scalar_type() == keys.scalar_type(),
-+                "author FIER metadata dtype must match keys");
++                "FIER metadata dtype must match keys");
 +    TORCH_CHECK(packed.dim() == 3 && packed.size(0) == keys.size(0) &&
-+                packed.size(2) == keys.size(2), "author FIER packed shape mismatch");
++                packed.size(2) == keys.size(2), "FIER packed shape mismatch");
 +    TORCH_CHECK(group_zero.sizes() == group_scale.sizes() && group_zero.dim() == 3 &&
 +                group_zero.size(0) == keys.size(0) && group_zero.size(2) == keys.size(2),
-+                "author FIER metadata shape mismatch");
++                "FIER metadata shape mismatch");
 +    int64_t word = token_offset / 32, group = word;
 +    TORCH_CHECK(token_offset >= 0 && token_offset % 32 == 0 &&
 +                word < packed.size(1) && group < group_zero.size(1),
-+                "author FIER token offset out of bounds");
++                "FIER token offset out of bounds");
 +    c10::cuda::CUDAGuard guard(keys.device());
 +    auto stream = at::cuda::getCurrentCUDAStream();
-+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_author_update_cuda", [&] {
-+        fier_author_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
++    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_update_cuda", [&] {
++        fier_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
 +            keys.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
 +            group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
 +            keys.size(1), keys.size(2), packed.size(1), group_zero.size(1), word, group);
@@ -470,7 +470,7 @@ index 1fcbe1a..3fea778 100644
 +    C10_CUDA_KERNEL_LAUNCH_CHECK();
 +}
 +
-+torch::Tensor fier_author_score_cuda(
++torch::Tensor fier_score_cuda(
 +    torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
 +    torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens) {
 +    CHECK_CUDA(queries); CHECK_CONTIGUOUS(queries); CHECK_FLOATISH(queries);
@@ -481,14 +481,14 @@ index 1fcbe1a..3fea778 100644
 +    TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
 +    int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
 +    TORCH_CHECK(queries.dim() == 3 && packed.dim() == 3 && group_zero.dim() == 3,
-+                "invalid author FIER tensor ranks");
++                "invalid FIER tensor ranks");
 +    TORCH_CHECK(packed.size(2) == head_dim && group_zero.size(2) == head_dim &&
-+                group_zero.sizes() == group_scale.sizes(), "author FIER shape mismatch");
++                group_zero.sizes() == group_scale.sizes(), "FIER shape mismatch");
 +    TORCH_CHECK(group_zero.scalar_type() == queries.scalar_type() &&
 +                group_scale.scalar_type() == queries.scalar_type(),
-+                "author FIER query/metadata dtype mismatch");
++                "FIER query/metadata dtype mismatch");
 +    TORCH_CHECK(tokens > 0 && tokens <= packed.size(1) * 32 &&
-+                (tokens + 31) / 32 <= group_zero.size(1), "invalid author FIER token count");
++                (tokens + 31) / 32 <= group_zero.size(1), "invalid FIER token count");
 +    TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
 +    auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
 +    int64_t used_words = (tokens + 31) / 32;
@@ -496,8 +496,8 @@ index 1fcbe1a..3fea778 100644
 +    dim3 threads(32, 4);
 +    c10::cuda::CUDAGuard guard(queries.device());
 +    auto stream = at::cuda::getCurrentCUDAStream();
-+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "fier_author_score_cuda", [&] {
-+        fier_author_score_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
++    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "fier_score_cuda", [&] {
++        fier_score_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
 +            queries.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
 +            group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
 +            head_to_kv.data_ptr<int64_t>(), reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),
@@ -676,17 +676,17 @@ index 7afdd80..fa9e7cb 100644
  
  def pack_keys(
 -    keys: torch.Tensor, *, group_size: int
-+    keys: torch.Tensor, *, group_size: int, implementation: str = "author"
++    keys: torch.Tensor, *, group_size: int, implementation: str = "fier"
  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 -    """Pack [KVH, T, D] keys and return (bits, group_min, group_max)."""
-+    """Pack authors-style FIER keys as [KVH, token_word, D]."""
++    """Pack FIER keys as [KVH, token_word, D]."""
  
      keys = keys.contiguous()
      _validate_keys(keys, int(group_size))
-+    if implementation != "author":
-+        raise ValueError("only the FIER authors implementation is public")
-+    if implementation == "author" and group_size != 32:
-+        raise ValueError("authors-style FIER requires group_size=32")
++    if implementation != "fier":
++        raise ValueError("only the FIER implementation is public")
++    if implementation == "fier" and group_size != 32:
++        raise ValueError("FIER requires group_size=32")
      kv_heads, tokens, head_dim = (int(v) for v in keys.shape)
      num_groups = math.ceil(tokens / group_size)
      words = math.ceil(tokens / 32)
@@ -695,7 +695,7 @@ index 7afdd80..fa9e7cb 100644
              num_warps=1,
          )
 +    packed = packed.transpose(1, 2).contiguous()
-+    maxs.sub_(mins)  # Author notation: zero=min, scale=max-min.
++    maxs.sub_(mins)  # FIER notation: zero=min, scale=max-min.
      return packed, mins, maxs
  
  
@@ -710,15 +710,15 @@ index 7afdd80..fa9e7cb 100644
      *,
      tokens: int,
      group_size: int,
-+    implementation: str = "author",
++    implementation: str = "fier",
  ) -> torch.Tensor:
 -    """Fused dequantization/GEMV for queries [B, QH, D]."""
 -
-+    """Authors-style fused 1-bit dequantization/GEMV for [B,QH,D]."""
-+    if implementation != "author":
-+        raise ValueError("only the FIER authors implementation is public")
++    """fused 1-bit dequantization/GEMV for [B,QH,D]."""
++    if implementation != "fier":
++        raise ValueError("only the FIER implementation is public")
 +    if group_size != 32:
-+        raise ValueError("FIER-author requires group_size=32")
++        raise ValueError("FIER requires group_size=32")
      if queries.ndim != 3 or packed.ndim != 3:
          raise ValueError("queries and packed keys must be rank 3")
      if not queries.is_cuda or queries.device != packed.device:
@@ -735,9 +735,9 @@ index 7afdd80..fa9e7cb 100644
 +        raise RuntimeError("all FIER tensors must share a CUDA device")
 +    _, q_heads, head_dim = (int(v) for v in queries.shape)
 +    if int(packed.shape[2]) != head_dim:
-+        raise ValueError("authors-style packed key must be [KVH, words, head_dim]")
++        raise ValueError("packed key must be [KVH, words, head_dim]")
 +    if zero.shape != scale.shape or zero.ndim != 3:
-+        raise ValueError("authors-style zero/scale tensors must have matching shapes")
++        raise ValueError("zero/scale tensors must have matching shapes")
      expected_groups = math.ceil(tokens / group_size)
 -    if int(mins.shape[1]) < expected_groups or int(mins.shape[2]) != head_dim:
 -        raise ValueError("metadata capacity is inconsistent with tokens/group_size")
@@ -753,13 +753,13 @@ index 7afdd80..fa9e7cb 100644
 -    scores = torch.empty(
 -        (batch, q_heads, tokens), device=queries.device, dtype=torch.float32
 +    if tokens <= 0 or tokens > int(packed.shape[1]) * 32:
-+        raise ValueError("tokens is inconsistent with authors-style packed storage")
++        raise ValueError("tokens is inconsistent with packed storage")
 +    if int(zero.shape[0]) != int(packed.shape[0]) or int(zero.shape[1]) < expected_groups:
-+        raise ValueError("authors-style metadata capacity is inconsistent with tokens")
++        raise ValueError("metadata capacity is inconsistent with tokens")
 +    if int(zero.shape[2]) != head_dim or head_to_kv.numel() != q_heads:
-+        raise ValueError("authors-style head dimensions or mapping are inconsistent")
-+    from popkv_cuda import score_fier_author
-+    return score_fier_author(
++        raise ValueError("head dimensions or mapping are inconsistent")
++    from popkv_cuda import score_fier
++    return score_fier(
 +        queries.contiguous(), packed, zero, scale,
 +        head_to_kv=head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous(),
 +        tokens=tokens,
@@ -792,7 +792,7 @@ index 7afdd80..fa9e7cb 100644
      *,
      head_to_kv: torch.Tensor,
      group_size: int,
-+    implementation: str = "author",
++    implementation: str = "fier",
  ) -> torch.Tensor:
 -    packed, mins, maxs = pack_keys(keys, group_size=group_size)
 +    packed, mins, maxs = pack_keys(keys, group_size=group_size, implementation=implementation)
@@ -814,7 +814,7 @@ index 24ad96b..2b6e4f3 100644
  import torch.nn.functional as F
  
 -METHODS = ("full", "quest", "fier", "popkv")
-+METHODS = ("full", "quest", "fier-author", "popkv-normal", "popkv-q", "popkv-s")
++METHODS = ("full", "quest", "fier", "popkv-normal", "popkv-q", "popkv-s")
 +
 +POPKV_PRESETS = {
 +    "popkv-normal": (32, 32),
@@ -828,7 +828,7 @@ index 24ad96b..2b6e4f3 100644
      dim_group_size: int = 32  # dimensions sharing low/delta representatives (G_dim)
      dim_kernel: str = "auto"  # specialized score kernel; auto follows G_dim
      quest_page_size: int = 16
-+    fier_kernel: str = "author"
++    fier_kernel: str = "fier"
      full_layers: tuple[int, ...] = (0, 1)
  
      def validate(self) -> None:
@@ -836,8 +836,8 @@ index 24ad96b..2b6e4f3 100644
                  )
          if self.quest_page_size <= 0:
              raise ValueError("quest_page_size must be positive")
-+        if self.fier_kernel != "author":
-+            raise ValueError("the public FIER method is fixed to the authors implementation")
++        if self.fier_kernel != "fier":
++            raise ValueError("the public FIER method is fixed to the FIER implementation")
  
  
  @dataclass
@@ -845,7 +845,7 @@ index 24ad96b..2b6e4f3 100644
      group_max: torch.Tensor
      active_keys: torch.Tensor
  
-+    implementation: str = "author"
++    implementation: str = "fier"
  
  @dataclass
  class PopKVCache:
@@ -912,7 +912,7 @@ index 24ad96b..2b6e4f3 100644
 -def build_fier_cache(keys: torch.Tensor, *, group_size: int, reserve_tokens: int) -> FIERCache:
 +def build_fier_cache(
 +    keys: torch.Tensor, *, group_size: int, reserve_tokens: int,
-+    implementation: str = "author",
++    implementation: str = "fier",
 +) -> FIERCache:
      from fier_triton import pack_keys
  
@@ -924,7 +924,7 @@ index 24ad96b..2b6e4f3 100644
      capacity = math.ceil((tokens + reserve_tokens) / group_size) * group_size
 +    words = math.ceil(capacity / 32)
 +    packed_shape = (
-+        (kv_heads, words, dim) if implementation == "author"
++        (kv_heads, words, dim) if implementation == "fier"
 +        else (kv_heads, dim, words)
 +    )
      packed_storage = torch.empty(
@@ -936,7 +936,7 @@ index 24ad96b..2b6e4f3 100644
      )
      max_storage = torch.empty_like(min_storage)
 -    packed_storage[:, :, : packed.shape[2]].copy_(packed)
-+    if implementation == "author":
++    if implementation == "fier":
 +        packed_storage[:, : packed.shape[1], :].copy_(packed)
 +    else:
 +        packed_storage[:, :, : packed.shape[2]].copy_(packed)
@@ -953,21 +953,21 @@ index 24ad96b..2b6e4f3 100644
  
  
  def write_fier_active(cache: FIERCache) -> None:
--    from popkv_cuda import update_fier_metadata
+-    from popkv_cuda import update_fier_legacy_metadata
 -
--    update_fier_metadata(
+-    update_fier_legacy_metadata(
 -        cache.active_keys, cache.packed, cache.group_min, cache.group_max,
 -        token_offset=cache.sealed_tokens,
 -    )
-+    if cache.implementation == "author":
-+        from popkv_cuda import update_fier_author_metadata
-+        update_fier_author_metadata(
++    if cache.implementation == "fier":
++        from popkv_cuda import update_fier_metadata
++        update_fier_metadata(
 +            cache.active_keys, cache.packed, cache.group_min, cache.group_max,
 +            token_offset=cache.sealed_tokens,
 +        )
 +    else:
-+        from popkv_cuda import update_fier_metadata
-+        update_fier_metadata(
++        from popkv_cuda import update_fier_legacy_metadata
++        update_fier_legacy_metadata(
 +            cache.active_keys, cache.packed, cache.group_min, cache.group_max,
 +            token_offset=cache.sealed_tokens,
 +        )
@@ -1028,10 +1028,10 @@ index 24ad96b..2b6e4f3 100644
                      keys, page_size=self.retrieval.quest_page_size, reserve_tokens=reserve_tokens,
                  )
 -            elif method == "fier":
-+            elif method == "fier-author":
++            elif method == "fier":
                  layers[layer] = build_fier_cache(
                      keys, group_size=TOKEN_GROUP_SIZE, reserve_tokens=reserve_tokens,
-+                    implementation="author",
++                    implementation="fier",
                  )
              else:
 +                try:
@@ -1088,7 +1088,7 @@ index 24ad96b..2b6e4f3 100644
                      )
                      timer.mark("topk")
 -                elif method == "fier":
-+                elif method == "fier-author":
++                elif method == "fier":
                      assert isinstance(sparse_cache, FIERCache)
                      from fier_triton import score_packed_batched
                      def score_fier():
@@ -1096,7 +1096,7 @@ index 24ad96b..2b6e4f3 100644
                              q[0, :, 0].unsqueeze(0), sparse_cache.packed,
                              sparse_cache.group_min, sparse_cache.group_max,
                              self.head_to_kv, tokens=prefix_length, group_size=sparse_cache.group_size,
-+                            implementation="author",
++                            implementation="fier",
                          )
 -                    scores = score_fier(); timer.mark("score")
 +                    scores = score_fier(); timer.mark("retrieval_score")
@@ -1157,11 +1157,11 @@ diff --git a/popkv_cuda.py b/popkv_cuda.py
 index ec15a3b..b2a9d19 100644
 --- a/popkv_cuda.py
 +++ b/popkv_cuda.py
-@@ -100,6 +100,44 @@ def update_fier_metadata(active_keys: torch.Tensor, packed: torch.Tensor, group_
-     _extension().fier_update(active_keys, packed, group_min, group_max, int(token_offset))
+@@ -100,6 +100,44 @@ def update_fier_legacy_metadata(active_keys: torch.Tensor, packed: torch.Tensor, group_
+     _extension().fier_legacy_update(active_keys, packed, group_min, group_max, int(token_offset))
  
  
-+def update_fier_author_metadata(
++def update_fier_metadata(
 +    active_keys: torch.Tensor,
 +    packed: torch.Tensor,
 +    group_zero: torch.Tensor,
@@ -1169,15 +1169,15 @@ index ec15a3b..b2a9d19 100644
 +    *,
 +    token_offset: int,
 +) -> None:
-+    """Update one active g32 word in the authors' word-major cache layout."""
++    """Update one active g32 word in the word-major cache layout."""
 +    if active_keys.ndim != 3 or not active_keys.is_cuda or not active_keys.is_contiguous():
 +        raise ValueError("active_keys must be contiguous CUDA [KV heads, tokens, head dim]")
-+    _extension().fier_author_update(
++    _extension().fier_update(
 +        active_keys, packed, group_zero, group_scale, int(token_offset)
 +    )
 +
 +
-+def score_fier_author(
++def score_fier(
 +    queries: torch.Tensor,
 +    packed: torch.Tensor,
 +    group_zero: torch.Tensor,
@@ -1186,10 +1186,10 @@ index ec15a3b..b2a9d19 100644
 +    head_to_kv: torch.Tensor,
 +    tokens: int,
 +) -> torch.Tensor:
-+    """Authors-style fused 1-bit dequantization/GEMV with FP16 scores."""
++    """fused 1-bit dequantization/GEMV with FP16 scores."""
 +    if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
 +        raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
-+    return _extension().fier_author_score(
++    return _extension().fier_score(
 +        queries,
 +        packed,
 +        group_zero,

@@ -11,12 +11,12 @@ class ResourceCostTests(unittest.TestCase):
         self.assertEqual(rows["QUEST"]["popcount_ops"], 0)
 
         self.assertGreater(rows["PopKV-Q"]["popcount_ops"], rows["PopKV-S"]["popcount_ops"])
-        self.assertEqual(rows["FIER-author"]["popcount_ops"], 0)
+        self.assertEqual(rows["FIER"]["popcount_ops"], 0)
 
     def test_public_profiles_include_normal_ablation(self):
         self.assertEqual(
             tuple(profile.label for profile in PROFILES),
-            ("Full", "QUEST", "FIER-author", "PopKV-Normal", "PopKV-Q", "PopKV-S"),
+            ("Full", "QUEST", "FIER", "PopKV-Normal", "PopKV-Q", "PopKV-S"),
         )
 
     def test_sparse_metadata_is_additional_to_full_kv(self):
