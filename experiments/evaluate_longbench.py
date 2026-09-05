@@ -16,17 +16,16 @@ import time
 import zipfile
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 
-from popkv import LlamaSparseDecoder, RetrievalConfig, load_hf_model
+from popkv import LlamaSparseDecoder, METHODS, POPKV_PRESETS, RetrievalConfig, load_hf_model
 
 
 PROMPTS = {
-    "narrativeqa": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\nNow, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
     "qasper": "You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nArticle: {context}\n\nAnswer the question based on the above article as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
     "multifieldqa_en": "Read the following text and answer briefly.\n\n{context}\n\nNow, answer the following question based on the above text, only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
     "hotpotqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
@@ -35,7 +34,6 @@ PROMPTS = {
 }
 
 MAX_GEN = {
-    "narrativeqa": 128,
     "qasper": 128,
     "multifieldqa_en": 64,
     "hotpotqa": 32,
@@ -44,6 +42,23 @@ MAX_GEN = {
 }
 QA_DATASETS = frozenset(PROMPTS) - {"gov_report"}
 NO_CHAT_DATASETS = frozenset({"triviaqa"})
+
+LATENCY_KEYS = (
+    "decode_ms", "frontend_ms", "qkv_rope_ms",
+    "retrieval_query_encode_ms", "retrieval_score_ms", "retrieval_search_ms",
+    "score_ms", "topk_ms", "full_gather_ms", "full_attention_ms",
+    "sparse_attention_partial_ms", "sparse_attention_merge_ms",
+    "gather_ms", "attention_ms", "output_projection_ms", "mlp_ms",
+    "final_norm_lm_head_ms", "gpu_decode_ms", "gpu_component_sum_ms",
+    "gpu_unattributed_ms", "host_decode_residual_ms", "accounted_decode_ms",
+    "decode_closure_error_ms", "kv_update_ms", "retrieval_update_ms",
+    "retrieval_active_key_staging_ms", "retrieval_k_metadata_encoding_ms",
+    "retrieval_metadata_write_ms", "retrieval_group_sealing_ms",
+    "retrieval_gpu_component_sum_ms", "retrieval_gpu_unattributed_ms",
+    "retrieval_update_closure_error_ms", "update_gpu_ms",
+    "update_host_residual_ms", "update_ms", "token_selection_ms",
+    "token_cycle_ms", "generation_step_ms",
+)
 
 
 @dataclass(frozen=True)
@@ -69,11 +84,13 @@ class MethodSpec:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Time-bounded Pop-KV LongBench quality reproduction")
-    p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
-    p.add_argument("--methods", default="full,quest,fier,popkv")
+    p.add_argument("--model", default="NousResearch/Meta-Llama-3.1-8B-Instruct")
+    p.add_argument("--methods", default="full,quest,fier-author,popkv-q,popkv-s")
     p.add_argument("--datasets", default=",".join(PROMPTS))
-    p.add_argument("--budgets", default="512,1024,2048,4096")
+    p.add_argument("--budgets", default="4096")
     p.add_argument("--samples-per-dataset", type=int, default=40)
+    p.add_argument("--all-samples", action="store_true",
+                   help="use every valid row in each selected dataset; overrides --samples-per-dataset")
     p.add_argument("--max-context", type=int, default=32768)
     p.add_argument("--group-size", type=int, choices=(8, 16, 32, 64, 128), default=32,
                    help="token-axis magnitude-threshold group size")
@@ -82,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dim-kernel", choices=("auto", "g16", "g32", "g64-u32", "g64-u64"),
                    default="auto", help="specialized PopKV dimension-score kernel")
     p.add_argument("--quest-page-size", type=int, default=16)
+    p.add_argument("--fier-kernel", choices=("author",), default="author")
     p.add_argument("--full-layers", default="0,1")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -96,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--validate", action="store_true")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--aggregate-only", action="store_true", help="rebuild tables from saved results without loading a model")
     return p.parse_args()
 
 
@@ -151,6 +170,8 @@ def rouge_l(prediction: str, truth: str) -> float:
 
 
 def score_prediction(dataset: str, prediction: str, answers: Iterable[str]) -> float:
+    if dataset not in PROMPTS:
+        raise ValueError(f"Unsupported dataset: {dataset}")
     if dataset == "triviaqa":
         prediction = prediction.lstrip("\n").split("\n", 1)[0]
     metric = rouge_l if dataset == "gov_report" else qa_f1
@@ -227,9 +248,9 @@ def load_samples(tokenizer: Any, args: argparse.Namespace, datasets: tuple[str, 
                 max_new_tokens=max_new,
             ))
             count += 1
-            if count >= args.samples_per_dataset:
+            if not args.all_samples and count >= args.samples_per_dataset:
                 break
-        if count < args.samples_per_dataset:
+        if not args.all_samples and count < args.samples_per_dataset:
             raise RuntimeError(f"Only {count} valid rows in {dataset}; requested {args.samples_per_dataset}")
         print(f"selected dataset={dataset} samples={count} token_range="
               f"{min(x.prompt_tokens for x in selected if x.dataset == dataset)}.."
@@ -239,24 +260,17 @@ def load_samples(tokenizer: Any, args: argparse.Namespace, datasets: tuple[str, 
 
 def method_specs(
     methods: tuple[str, ...], budgets: tuple[int, ...], group: int, dim_group: int,
-    dim_kernel: str, page: int,
+    dim_kernel: str, page: int, fier_kernel: str = "author",
 ) -> list[MethodSpec]:
+    del group, dim_group, dim_kernel, fier_kernel
     result: list[MethodSpec] = []
     for method in methods:
         if method == "full":
             result.append(MethodSpec("full", "full", None))
         else:
             for budget in budgets:
-                if method == "quest":
-                    label = f"quest_p{page}_b{budget}"
-                elif method == "popkv" and (dim_group != 32 or dim_kernel != "auto"):
-                    kernel = ({16: "g16", 32: "g32", 64: "g64-u32"}[dim_group]
-                              if dim_kernel == "auto" else dim_kernel)
-                    label = f"popkv_tg{group}_{kernel}_b{budget}"
-                else:
-                    # Preserve existing G32/FIER labels for resumable outputs.
-                    label = f"{method}_g{group}_b{budget}"
-                result.append(MethodSpec(method, label, budget))
+                suffix = f"_p{page}" if method == "quest" else ""
+                result.append(MethodSpec(method, f"{method}{suffix}_b{budget}", budget))
     return result
 
 
@@ -264,10 +278,8 @@ def retrieval_for(args: argparse.Namespace, spec: MethodSpec) -> RetrievalConfig
     return RetrievalConfig(
         budget=spec.budget or max(int_tuple(args.budgets)),
         quest_page_size=args.quest_page_size,
-        group_size=args.group_size,
-        dim_group_size=args.dim_group_size,
-        dim_kernel=args.dim_kernel,
         full_layers=int_tuple(args.full_layers),
+        fier_kernel="author",
     )
 
 
@@ -317,20 +329,107 @@ def generate_one(decoder: LlamaSparseDecoder, tokenizer: Any, sample: Sample, sp
             past, current_id, method=spec.method, retrieval_caches=packed, return_new_kv=True
         )
         sync(decoder.device)
-        totals["decode_ms"] += (time.perf_counter() - step_started) * 1000
-        update_started = time.perf_counter()
-        decoder.append_kv(past, new_keys, new_values)
-        if packed is not None:
-            decoder.append_retrieval_caches(packed, new_keys)
+        decode_ms = (time.perf_counter() - step_started) * 1000
+
+        selection_started = time.perf_counter()
+        if decoder.device.type == "cuda":
+            selection_start = torch.cuda.Event(enable_timing=True)
+            selection_end = torch.cuda.Event(enable_timing=True)
+            selection_start.record()
+        next_id_tensor = torch.argmax(logits)
+        if decoder.device.type == "cuda":
+            selection_end.record()
         sync(decoder.device)
-        totals["update_ms"] += (time.perf_counter() - update_started) * 1000
-        totals["search_ms"] += diag.candidate_search_ms
-        totals["score_ms"] += diag.candidate_score_ms
-        totals["topk_ms"] += diag.candidate_topk_ms
-        totals["gather_ms"] += diag.selected_gather_ms
-        totals["attention_ms"] += diag.selected_attention_ms
+        token_selection_ms = (
+            float(selection_start.elapsed_time(selection_end))
+            if decoder.device.type == "cuda"
+            else (time.perf_counter() - selection_started) * 1000
+        )
+        next_id = int(next_id_tensor.item())
+
+        update_started = time.perf_counter()
+        if decoder.device.type == "cuda":
+            update_start = torch.cuda.Event(enable_timing=True)
+            update_middle = torch.cuda.Event(enable_timing=True)
+            update_end = torch.cuda.Event(enable_timing=True)
+            update_start.record()
+        decoder.append_kv(past, new_keys, new_values)
+        if decoder.device.type == "cuda":
+            update_middle.record()
+        retrieval_timer = (
+            None if packed is None
+            else decoder.append_retrieval_caches(packed, new_keys, measure=True)
+        )
+        if packed is not None and decoder.device.type == "cuda":
+            update_end.record()
+        sync(decoder.device)
+        update_ms = (time.perf_counter() - update_started) * 1000
+        if decoder.device.type == "cuda":
+            kv_update_ms = float(update_start.elapsed_time(update_middle))
+            retrieval_update_ms = (
+                0.0 if packed is None else float(update_middle.elapsed_time(update_end))
+            )
+        else:
+            kv_update_ms, retrieval_update_ms = update_ms, 0.0
+        retrieval_parts = (
+            {name: 0.0 for name in (
+                "active_key_staging", "k_metadata_encoding", "metadata_write", "group_sealing",
+            )}
+            if retrieval_timer is None else retrieval_timer.totals()
+        )
+        retrieval_component_sum_ms = sum(retrieval_parts.values())
+        retrieval_gpu_unattributed_ms = retrieval_update_ms - retrieval_component_sum_ms
+        update_gpu_ms = kv_update_ms + retrieval_update_ms
+        update_host_residual_ms = update_ms - update_gpu_ms
+        host_decode_residual_ms = decode_ms - diag.gpu_decode_ms
+        accounted_decode_ms = (
+            diag.gpu_component_sum_ms + diag.gpu_unattributed_ms + host_decode_residual_ms
+        )
+        measurements = {
+            "decode_ms": decode_ms,
+            "frontend_ms": diag.frontend_ms,
+            "qkv_rope_ms": diag.qkv_rope_ms,
+            "retrieval_query_encode_ms": diag.retrieval_query_encode_ms,
+            "retrieval_score_ms": diag.retrieval_score_ms,
+            "retrieval_search_ms": diag.retrieval_search_ms,
+            "score_ms": diag.candidate_score_ms,
+            "topk_ms": diag.candidate_topk_ms,
+            "full_gather_ms": diag.full_gather_ms,
+            "full_attention_ms": diag.full_attention_ms,
+            "sparse_attention_partial_ms": diag.sparse_attention_partial_ms,
+            "sparse_attention_merge_ms": diag.sparse_attention_merge_ms,
+            "gather_ms": diag.selected_gather_ms,
+            "attention_ms": diag.selected_attention_ms,
+            "output_projection_ms": diag.output_projection_ms,
+            "mlp_ms": diag.mlp_ms,
+            "final_norm_lm_head_ms": diag.final_norm_lm_head_ms,
+            "gpu_decode_ms": diag.gpu_decode_ms,
+            "gpu_component_sum_ms": diag.gpu_component_sum_ms,
+            "gpu_unattributed_ms": diag.gpu_unattributed_ms,
+            "host_decode_residual_ms": host_decode_residual_ms,
+            "accounted_decode_ms": accounted_decode_ms,
+            "decode_closure_error_ms": decode_ms - accounted_decode_ms,
+            "kv_update_ms": kv_update_ms,
+            "retrieval_update_ms": retrieval_update_ms,
+            "retrieval_active_key_staging_ms": retrieval_parts["active_key_staging"],
+            "retrieval_k_metadata_encoding_ms": retrieval_parts["k_metadata_encoding"],
+            "retrieval_metadata_write_ms": retrieval_parts["metadata_write"],
+            "retrieval_group_sealing_ms": retrieval_parts["group_sealing"],
+            "retrieval_gpu_component_sum_ms": retrieval_component_sum_ms,
+            "retrieval_gpu_unattributed_ms": retrieval_gpu_unattributed_ms,
+            "retrieval_update_closure_error_ms": (
+                retrieval_update_ms - retrieval_component_sum_ms - retrieval_gpu_unattributed_ms
+            ),
+            "update_gpu_ms": update_gpu_ms,
+            "update_host_residual_ms": update_host_residual_ms,
+            "update_ms": update_ms,
+            "token_selection_ms": token_selection_ms,
+            "token_cycle_ms": decode_ms + update_ms,
+            "generation_step_ms": decode_ms + token_selection_ms + update_ms,
+        }
+        for name, value in measurements.items():
+            totals[name] += value
         totals["candidate_ratio"] += diag.candidate_ratio
-        next_id = int(torch.argmax(logits).item())
         if next_id in stops:
             stopped_on_eos = True
             break
@@ -354,7 +453,7 @@ def generate_one(decoder: LlamaSparseDecoder, tokenizer: Any, sample: Sample, sp
         "wall_decode_ms_per_token": generation_seconds * 1000 / steps,
         "peak_gpu_memory_bytes": peak,
     }
-    for name in ("decode_ms", "update_ms", "search_ms", "score_ms", "topk_ms", "gather_ms", "attention_ms", "candidate_ratio"):
+    for name in (*LATENCY_KEYS, "candidate_ratio"):
         row[f"{name}_per_token"] = totals[name] / steps
     return row
 
@@ -393,6 +492,13 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> Non
 
 def aggregate(output_dir: Path, model_id: str) -> None:
     rows = [r for r in read_jsonl(output_dir / "raw_results.jsonl") if r.get("status") == "ok"]
+    if not rows:
+        raise ValueError("No completed samples to aggregate")
+    if any(r["dataset"] not in PROMPTS for r in rows):
+        raise ValueError("Results contain unsupported datasets")
+    keys = [result_key(r) for r in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Duplicate completed samples in raw results")
     groups: dict[tuple[str, str, int | None], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(row["method"], row["dataset"], row.get("budget"))].append(row)
@@ -412,17 +518,29 @@ def aggregate(output_dir: Path, model_id: str) -> None:
             "avg_input_tokens": sum(r["prompt_tokens"] for r in group) / len(group),
             "avg_output_tokens": sum(r["generated_tokens"] for r in group) / len(group),
         })
-        runtime.append({
+        runtime_row = {
             "method": method, "budget": budget, "dataset": dataset, "num_success": len(group),
+            "total_decode_steps": sum(r["decode_steps"] for r in group),
+            "total_generated_tokens": sum(r["generated_tokens"] for r in group),
+            "avg_prefill_seconds_shared": sum(r["prefill_seconds_shared"] for r in group) / len(group),
+            "avg_prepack_seconds": sum(r["prepack_seconds"] for r in group) / len(group),
             "total_generation_seconds": sum(r["generation_seconds"] for r in group),
+            "avg_generation_seconds": sum(r["generation_seconds"] for r in group) / len(group),
+            "avg_method_wall_seconds": sum(
+                r.get("method_wall_seconds", r["generation_seconds"]) for r in group
+            ) / len(group),
             "avg_wall_decode_ms_per_token": sum(r["wall_decode_ms_per_token"] for r in group) / len(group),
-            "avg_search_ms_per_token": sum(r["search_ms_per_token"] for r in group) / len(group),
-            "avg_score_ms_per_token": sum(r["score_ms_per_token"] for r in group) / len(group),
-            "avg_topk_ms_per_token": sum(r["topk_ms_per_token"] for r in group) / len(group),
-            "avg_gather_ms_per_token": sum(r["gather_ms_per_token"] for r in group) / len(group),
-            "avg_attention_ms_per_token": sum(r["attention_ms_per_token"] for r in group) / len(group),
-            "peak_gpu_memory_bytes": max(r["peak_gpu_memory_bytes"] for r in group), "failed_samples": failed,
-        })
+            "peak_gpu_memory_bytes": max(r["peak_gpu_memory_bytes"] for r in group),
+            "failed_samples": failed,
+        }
+        for name in LATENCY_KEYS:
+            runtime_row[f"avg_{name}_per_token"] = (
+                sum(r[f"{name}_per_token"] for r in group) / len(group)
+            )
+        runtime_row["avg_search_ms_per_token"] = runtime_row[
+            "avg_retrieval_search_ms_per_token"
+        ]
+        runtime.append(runtime_row)
     score_cols = ["model", "method", "dataset", "budget", "metric", "score", "full_score", "retention_percent",
                   "num_samples", "num_success", "num_failed", "avg_input_tokens", "avg_output_tokens"]
     runtime_cols = list(runtime[0]) if runtime else ["method", "budget", "dataset"]
@@ -471,7 +589,7 @@ def write_readme(output_dir: Path, scores: list[dict[str, Any]], summaries: list
     runtime_rows = [[r["method"], r["budget"], r["dataset"], r["avg_wall_decode_ms_per_token"],
                      r["avg_search_ms_per_token"], r["avg_attention_ms_per_token"], r["failed_samples"]] for r in runtime]
     text = "# LongBench Pop-KV reproduction\n\n"
-    text += "Scores are percentages. Only actually completed samples are included. Original Llama-3 has an 8K configured context window; the paper-requested 32K setting extrapolates RoPE beyond that window.\n\n"
+    text += "Scores are percentages; only completed samples are included. Average is the unweighted mean of task scores. Retention is the mean of per-task score / Full score ratios, not the ratio of task averages. See experiment_config.json for the model and context settings.\n\n"
     text += "## Task scores\n\n" + markdown_table(["Method", "Budget", *task_order, "Average"], task_rows) + "\n\n"
     text += "## Retention vs Full\n\n" + markdown_table(["Method", "Budget", "Average", "Retention %", "Min task %"], retention_rows) + "\n\n"
     text += "## Runtime\n\n" + markdown_table(["Method", "Budget", "Dataset", "Decode ms/tok", "Search", "Attention", "Failed"], runtime_rows) + "\n"
@@ -507,7 +625,7 @@ def validate_short(decoder: LlamaSparseDecoder, tokenizer: Any, sample: Sample, 
     manual = generate_one(decoder, tokenizer, short, MethodSpec("full", "full", None), base, 0.0)["output_ids"]
     if manual != hf_ids[:len(manual)]:
         raise AssertionError(f"HF/manual Full mismatch: hf={hf_ids} manual={manual}")
-    for method in ("quest", "fier", "popkv"):
+    for method in ("quest", "fier-author", "popkv-q", "popkv-s"):
         spec = MethodSpec(method, f"validate_{method}", len(ids) + 8)
         decoder.retrieval = retrieval_for(args, spec)
         result = generate_one(decoder, tokenizer, short, spec, base, 0.0)
@@ -519,23 +637,29 @@ def validate_short(decoder: LlamaSparseDecoder, tokenizer: Any, sample: Sample, 
 def main() -> None:
     process_started = time.monotonic()
     args = parse_args()
-    if args.hard_limit_minutes <= 0 or args.hard_limit_minutes > 240:
-        raise SystemExit("--hard-limit-minutes must be in (0, 240]")
+    if args.aggregate_only:
+        config = json.loads((Path(args.output_dir) / "experiment_config.json").read_text())
+        aggregate(Path(args.output_dir), config["model"])
+        return
+    if args.hard_limit_minutes <= 0 or args.hard_limit_minutes > 2880:
+        raise SystemExit("--hard-limit-minutes must be in (0, 2880]")
     if args.stop_reserve_minutes < 1 or args.stop_reserve_minutes >= args.hard_limit_minutes:
         raise SystemExit("invalid --stop-reserve-minutes")
     methods, datasets, budgets = comma_tuple(args.methods), comma_tuple(args.datasets), int_tuple(args.budgets)
-    unknown_methods = set(methods) - {"full", "quest", "fier", "popkv"}
+    unknown_methods = set(methods) - set(METHODS)
     unknown_datasets = set(datasets) - set(PROMPTS)
     if unknown_methods or unknown_datasets or not budgets:
         raise SystemExit(f"invalid methods={unknown_methods} datasets={unknown_datasets} budgets={budgets}")
     specs = method_specs(methods, budgets, args.group_size, args.dim_group_size,
-                         args.dim_kernel, args.quest_page_size)
+                         args.dim_kernel, args.quest_page_size, args.fier_kernel)
     output_dir = Path(args.output_dir)
     config = vars(args) | {
         "resolved_methods": [asdict(x) for x in specs], "resolved_datasets": datasets,
         "gqa_policy": "per query-head Top-k; query heads sharing a KV head may select different token positions; exact FP K/V read directly by indexed attention using head_to_kv",
         "fier": "sequence-grouped g32 1-bit RTN, token Top-k, current token reserves one slot",
         "popkv": "Q/K sign and magnitude encoding with max/2 and min/2 thresholds; representative-weighted fused CUDA scoring; per-query-head Top-k; current token reserves one slot",
+        "popkv_presets": {name: {"token_group_size": values[0], "dim_group_size": values[1]}
+                          for name, values in POPKV_PRESETS.items()},
         "sink_recent_forced": False,
     }
     if args.dry_run:
@@ -545,6 +669,15 @@ def main() -> None:
     (output_dir / "predictions").mkdir(exist_ok=True)
     (output_dir / "experiment_config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
     (output_dir / "environment.txt").write_text(environment_text())
+    try:
+        (output_dir / "source_diff.patch").write_bytes(
+            subprocess.check_output(["git", "diff", "--binary"])
+        )
+        (output_dir / "pip_freeze.txt").write_text(
+            subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+        )
+    except Exception as exc:
+        (output_dir / "reproducibility_capture_error.txt").write_text(repr(exc) + chr(10))
     load_token()
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -552,6 +685,11 @@ def main() -> None:
     model, tokenizer = load_hf_model(
         args.model, dtype=args.dtype, device_map=args.device_map, attention=args.attention,
         trust_remote_code=args.trust_remote_code,
+    )
+    config["resolved_model_commit"] = getattr(model.config, "_commit_hash", None)
+    config["resolved_tokenizer_commit"] = tokenizer.init_kwargs.get("_commit_hash")
+    (output_dir / "experiment_config.json").write_text(
+        json.dumps(config, indent=2, ensure_ascii=False) + chr(10)
     )
     base_retrieval = retrieval_for(args, specs[0])
     decoder = LlamaSparseDecoder(model, base_retrieval)
@@ -564,6 +702,7 @@ def main() -> None:
     if raw_path.exists() and not args.resume:
         raise SystemExit(f"{raw_path} exists and --no-resume was used")
     completed = {result_key(r) for r in read_jsonl(raw_path) if r.get("status") == "ok"}
+    initially_completed = len(completed)
     durations: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=12))
     deadline = process_started + args.hard_limit_minutes * 60
     soft_deadline = deadline - args.stop_reserve_minutes * 60
@@ -576,17 +715,31 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    samples_by_dataset = {
+        dataset: [sample for sample in samples if sample.dataset == dataset]
+        for dataset in datasets
+    }
+    sample_counts = {dataset: len(group) for dataset, group in samples_by_dataset.items()}
     total_target = len(samples) * len(specs)
-    for sample_no in range(args.samples_per_dataset):
+    for sample_no in range(max(sample_counts.values())):
         for dataset in datasets:
-            sample = next(s for s in samples if s.dataset == dataset and sum(
-                1 for x in samples if x.dataset == dataset and x.source_index <= s.source_index
-            ) == sample_no + 1)
+            if sample_no >= sample_counts[dataset]:
+                continue
+            sample = samples_by_dataset[dataset][sample_no]
             pending = [spec for spec in specs if (sample.dataset, sample.sample_id, spec.label) not in completed]
             if not pending:
                 continue
             remaining = soft_deadline - time.monotonic()
-            defaults = {"full": .34, "quest": .82, "fier": .52, "popkv": .50}
+            defaults = {
+                "full": .34,
+                "quest": .82,
+                "fier": .52,
+                "fier-author": .52,
+                "popkv": .50,
+                "popkv-normal": .50,
+                "popkv-q": .50,
+                "popkv-s": .50,
+            }
             estimate = 20.0 + sum((sum(durations[x.label]) / len(durations[x.label]) if durations[x.label]
                                    else 3 + defaults[x.method] * sample.max_new_tokens) for x in pending)
             if stop_requested or remaining <= estimate:
@@ -621,14 +774,18 @@ def main() -> None:
                 started = time.monotonic()
                 try:
                     result = generate_one(decoder, tokenizer, sample, spec, base_past, prefill_seconds)
-                    row = common | result | {"elapsed_seconds": time.monotonic() - process_started}
+                    method_wall_seconds = time.monotonic() - started
+                    row = common | result | {
+                        "method_wall_seconds": method_wall_seconds,
+                        "elapsed_seconds": time.monotonic() - process_started,
+                    }
                     append_jsonl(raw_path, row)
                     pred_name = f"{args.model.split('/')[-1]}_{common['method']}_{sample.dataset}_budget{spec.budget if spec.budget is not None else 'full'}.jsonl"
                     append_jsonl(output_dir / "predictions" / pred_name,
                                  {"sample_id": sample.sample_id, "prediction": result["prediction"],
                                   "answers": sample.answers, "score": result["score"], "input_sha256": sample.input_sha256})
                     completed.add(result_key(row))
-                    durations[spec.label].append(time.monotonic() - started)
+                    durations[spec.label].append(method_wall_seconds)
                 except Exception as exc:
                     error = common | {"status": "error", "error": repr(exc), "elapsed_seconds": time.monotonic() - process_started}
                     append_jsonl(output_dir / "errors.jsonl", error)
@@ -637,9 +794,21 @@ def main() -> None:
                         torch.cuda.empty_cache()
                 done = len(completed)
                 recent = durations[spec.label][-1] if durations[spec.label] else 0
-                print(f"progress={done}/{total_target} dataset={sample.dataset} sample={sample_no+1}/{args.samples_per_dataset} "
-                      f"method={spec.label} duration={recent:.1f}s elapsed={(time.monotonic()-process_started)/60:.1f}m "
-                      f"remaining={(deadline-time.monotonic())/60:.1f}m", flush=True)
+                run_done = done - initially_completed
+                elapsed = time.monotonic() - process_started
+                if run_done > 0:
+                    eta_seconds = elapsed / run_done * (total_target - done)
+                    eta_utc = datetime.now(timezone.utc) + timedelta(seconds=eta_seconds)
+                    eta_kst = eta_utc.astimezone(timezone(timedelta(hours=9)))
+                    eta_text = (
+                        f" eta_utc={eta_utc.isoformat(timespec='seconds')}"
+                        f" eta_kst={eta_kst.isoformat(timespec='seconds')}"
+                    )
+                else:
+                    eta_text = ""
+                print(f"progress={done}/{total_target} dataset={sample.dataset} sample={sample_no+1}/{sample_counts[dataset]} "
+                      f"method={spec.label} duration={recent:.1f}s elapsed={elapsed/60:.1f}m "
+                      f"remaining={(deadline-time.monotonic())/60:.1f}m{eta_text}", flush=True)
                 if stop_requested:
                     break
             del base_past

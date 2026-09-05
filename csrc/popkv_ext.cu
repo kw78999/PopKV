@@ -674,6 +674,240 @@ __global__ void popkv_score_dim_kernel(
     }
 }
 
+// Llama head_dim=128 production path. Query encoding is performed once per
+// query head, then token-tiled CTAs share each compressed K record across all
+// query heads mapped to the same GQA KV head. The existing token-major cache
+// permits aligned uint2 bitplane loads and half2 representative loads without
+// changing the cache footprint.
+template <typename scalar_t, int G_DIM>
+__global__ void popkv_query_encode_warp_kernel(
+    const scalar_t* __restrict__ queries, int32_t* __restrict__ q_sign_out,
+    int32_t* __restrict__ q_mag_out, float* __restrict__ q_low_out,
+    float* __restrict__ q_delta_out, int64_t rows) {
+    constexpr int WORDS = 4;
+    constexpr int REPS = 128 / G_DIM;
+    int64_t row = blockIdx.x;
+    int lane = threadIdx.x;
+    if (row >= rows) return;
+    int64_t q_base = row * 128;
+
+    float local_min = INFINITY, local_max = -INFINITY;
+#pragma unroll
+    for (int d = lane; d < 128; d += 32) {
+        float value = load_as_float(queries, q_base + d);
+        local_min = fminf(local_min, value);
+        local_max = fmaxf(local_max, value);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = fminf(local_min, __shfl_down_sync(0xffffffffu, local_min, offset));
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, offset));
+    }
+    float min_v = __shfl_sync(0xffffffffu, local_min, 0);
+    float max_v = __shfl_sync(0xffffffffu, local_max, 0);
+    float neg = min_v * 0.5f, pos = max_v * 0.5f;
+
+#pragma unroll
+    for (int word = 0; word < WORDS; ++word) {
+        float value = load_as_float(queries, q_base + word * 32 + lane);
+        bool sign = value >= 0.0f;
+        bool mag = sign ? (value > pos) : (value < neg);
+        uint32_t sign_word = __ballot_sync(0xffffffffu, sign);
+        uint32_t mag_word = __ballot_sync(0xffffffffu, mag);
+        if (lane == 0) {
+            q_sign_out[row * WORDS + word] = static_cast<int32_t>(sign_word);
+            q_mag_out[row * WORDS + word] = static_cast<int32_t>(mag_word);
+        }
+    }
+
+#pragma unroll
+    for (int rep = 0; rep < REPS; ++rep) {
+        float low_sum = 0.0f, high_sum = 0.0f;
+        int low_count = 0, high_count = 0;
+#pragma unroll
+        for (int local = lane; local < G_DIM; local += 32) {
+            float value = load_as_float(queries, q_base + rep * G_DIM + local);
+            bool sign = value >= 0.0f;
+            bool mag = sign ? (value > pos) : (value < neg);
+            if (mag) { high_sum += fabsf(value); ++high_count; }
+            else { low_sum += fabsf(value); ++low_count; }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            low_sum += __shfl_down_sync(0xffffffffu, low_sum, offset);
+            high_sum += __shfl_down_sync(0xffffffffu, high_sum, offset);
+            low_count += __shfl_down_sync(0xffffffffu, low_count, offset);
+            high_count += __shfl_down_sync(0xffffffffu, high_count, offset);
+        }
+        if (lane == 0) {
+            float low, high;
+            if (low_count == 0) {
+                low = high_count ? high_sum / high_count : 0.0f;
+                high = low;
+            } else {
+                low = low_sum / low_count;
+                high = high_count ? high_sum / high_count : low;
+            }
+            q_low_out[row * REPS + rep] = low;
+            q_delta_out[row * REPS + rep] = high - low;
+        }
+    }
+}
+
+template <int G_DIM, int TILE_TOKENS = 1024>
+__global__ void popkv_score_gqa_tiled_kernel(
+    const int32_t* __restrict__ k_sign, const int32_t* __restrict__ k_mag,
+    const __half* __restrict__ k_low, const __half* __restrict__ k_delta,
+    const int32_t* __restrict__ q_sign, const int32_t* __restrict__ q_mag,
+    const float* __restrict__ q_low, const float* __restrict__ q_delta,
+    const int64_t* __restrict__ head_to_kv, __half* __restrict__ scores,
+    int64_t batch, int64_t q_heads,
+    int64_t kv_heads, int64_t token_capacity, int64_t output_tokens) {
+    constexpr int WORDS = 4;
+    constexpr int REPS = 128 / G_DIM;
+    int64_t group_row = blockIdx.x;
+    int64_t batch_idx = group_row / kv_heads;
+    int64_t kv_slot = group_row % kv_heads;
+    int64_t q_per_kv = q_heads / kv_heads;
+    int64_t qh_start = kv_slot * q_per_kv;
+    int64_t query_row_start = batch_idx * q_heads + qh_start;
+    int64_t kvh = head_to_kv[qh_start];
+    int64_t tile_start = static_cast<int64_t>(blockIdx.y) * TILE_TOKENS;
+    float norm = rsqrtf(128.0f);
+    extern __shared__ unsigned char query_shared_raw[];
+    uint32_t* shared_q_sign = reinterpret_cast<uint32_t*>(query_shared_raw);
+    uint32_t* shared_q_mag = shared_q_sign + q_per_kv * WORDS;
+    float* shared_q_low = reinterpret_cast<float*>(shared_q_mag + q_per_kv * WORDS);
+    float* shared_q_delta = shared_q_low + q_per_kv * REPS;
+    int query_items = static_cast<int>(q_per_kv) * (2 * WORDS + 2 * REPS);
+    for (int item = threadIdx.x; item < query_items; item += blockDim.x) {
+        int plane_words = static_cast<int>(q_per_kv) * WORDS;
+        int rep_values = static_cast<int>(q_per_kv) * REPS;
+        if (item < plane_words)
+            shared_q_sign[item] = static_cast<uint32_t>(q_sign[query_row_start * WORDS + item]);
+        else if (item < 2 * plane_words) {
+            int offset = item - plane_words;
+            shared_q_mag[offset] = static_cast<uint32_t>(q_mag[query_row_start * WORDS + offset]);
+        } else if (item < 2 * plane_words + rep_values) {
+            int offset = item - 2 * plane_words;
+            shared_q_low[offset] = q_low[query_row_start * REPS + offset];
+        } else {
+            int offset = item - 2 * plane_words - rep_values;
+            shared_q_delta[offset] = q_delta[query_row_start * REPS + offset];
+        }
+    }
+    __syncthreads();
+
+    for (int local_token = threadIdx.x; local_token < TILE_TOKENS;
+         local_token += blockDim.x) {
+        int64_t token = tile_start + local_token;
+        if (token >= output_tokens) continue;
+        int64_t bit_base = (kvh * token_capacity + token) * WORDS;
+        int64_t rep_base = (kvh * token_capacity + token) * REPS;
+
+        uint32_t ks[WORDS], km[WORDS];
+        const uint2* sign_vec = reinterpret_cast<const uint2*>(k_sign + bit_base);
+        const uint2* mag_vec = reinterpret_cast<const uint2*>(k_mag + bit_base);
+        uint2 ks01 = sign_vec[0], ks23 = sign_vec[1];
+        uint2 km01 = mag_vec[0], km23 = mag_vec[1];
+        ks[0] = ks01.x; ks[1] = ks01.y; ks[2] = ks23.x; ks[3] = ks23.y;
+        km[0] = km01.x; km[1] = km01.y; km[2] = km23.x; km[3] = km23.y;
+
+        float kl[REPS], dk[REPS];
+#pragma unroll
+        for (int pair = 0; pair < REPS / 2; ++pair) {
+            float2 lows = __half22float2(reinterpret_cast<const __half2*>(k_low + rep_base)[pair]);
+            float2 deltas = __half22float2(reinterpret_cast<const __half2*>(k_delta + rep_base)[pair]);
+            kl[2 * pair] = lows.x; kl[2 * pair + 1] = lows.y;
+            dk[2 * pair] = deltas.x; dk[2 * pair + 1] = deltas.y;
+        }
+
+        for (int64_t q_local = 0; q_local < q_per_kv; ++q_local) {
+            int64_t qh = qh_start + q_local;
+            int64_t row = batch_idx * q_heads + qh;
+            int64_t q_bit_base = q_local * WORDS;
+            int64_t q_rep_base = q_local * REPS;
+            float total = 0.0f;
+            if constexpr (G_DIM == 16) {
+#pragma unroll
+                for (int rep = 0; rep < REPS; ++rep) {
+                    int word = rep / 2;
+                    uint32_t mask = (rep & 1) ? 0xffff0000u : 0x0000ffffu;
+                    total += popkv_reconstruct_u32(
+                        shared_q_sign[q_bit_base + word],
+                        shared_q_mag[q_bit_base + word],
+                        ks[word], km[word], mask, shared_q_low[q_rep_base + rep],
+                        shared_q_delta[q_rep_base + rep], kl[rep], dk[rep]);
+                }
+            } else if constexpr (G_DIM == 32) {
+#pragma unroll
+                for (int rep = 0; rep < REPS; ++rep) {
+                    total += popkv_reconstruct_u32(
+                        shared_q_sign[q_bit_base + rep],
+                        shared_q_mag[q_bit_base + rep],
+                        ks[rep], km[rep], 0xffffffffu, shared_q_low[q_rep_base + rep],
+                        shared_q_delta[q_rep_base + rep], kl[rep], dk[rep]);
+                }
+            } else {
+#pragma unroll
+                for (int rep = 0; rep < REPS; ++rep) {
+                    int c_sign = 0, c_q = 0, c_k = 0, c_qk = 0;
+#pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        int word = 2 * rep + half;
+                        uint32_t qm = shared_q_mag[q_bit_base + word];
+                        uint32_t match = ~(shared_q_sign[q_bit_base + word] ^ ks[word]);
+                        uint32_t both = qm & km[word];
+                        c_sign += 2 * __popc(match) - 32;
+                        c_q += 2 * __popc(match & qm) - __popc(qm);
+                        c_k += 2 * __popc(match & km[word]) - __popc(km[word]);
+                        c_qk += 2 * __popc(match & both) - __popc(both);
+                    }
+                    float ql = shared_q_low[q_rep_base + rep], dq = shared_q_delta[q_rep_base + rep];
+                    total += fmaf(ql * kl[rep], static_cast<float>(c_sign),
+                        fmaf(dq * kl[rep], static_cast<float>(c_q),
+                        fmaf(ql * dk[rep], static_cast<float>(c_k),
+                             dq * dk[rep] * static_cast<float>(c_qk))));
+                }
+            }
+            scores[row * output_tokens + token] = __float2half_rn(total * norm);
+        }
+    }
+}
+
+template <typename scalar_t, int G_DIM>
+static void launch_popkv_score_gqa_tiled(
+    torch::Tensor queries, torch::Tensor k_sign, torch::Tensor k_mag,
+    torch::Tensor low_mean, torch::Tensor delta_mean, torch::Tensor head_to_kv,
+    torch::Tensor scores) {
+    constexpr int WORDS = 4;
+    constexpr int REPS = 128 / G_DIM;
+    int64_t batch = queries.size(0), q_heads = queries.size(1);
+    int64_t kv_heads = k_sign.size(0), tokens = scores.size(2);
+    auto int_options = queries.options().dtype(torch::kInt32);
+    auto float_options = queries.options().dtype(torch::kFloat32);
+    auto q_sign = torch::empty({batch, q_heads, WORDS}, int_options);
+    auto q_mag = torch::empty_like(q_sign);
+    auto q_low = torch::empty({batch, q_heads, REPS}, float_options);
+    auto q_delta = torch::empty_like(q_low);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    popkv_query_encode_warp_kernel<scalar_t, G_DIM><<<batch * q_heads, 32, 0, stream>>>(
+        queries.data_ptr<scalar_t>(), q_sign.data_ptr<int32_t>(), q_mag.data_ptr<int32_t>(),
+        q_low.data_ptr<float>(), q_delta.data_ptr<float>(), batch * q_heads);
+    constexpr int TILE_TOKENS = 1024;
+    dim3 blocks(batch * kv_heads, (tokens + TILE_TOKENS - 1) / TILE_TOKENS);
+    size_t shared_bytes = static_cast<size_t>(q_heads / kv_heads) *
+        (2 * WORDS * sizeof(uint32_t) + 2 * REPS * sizeof(float));
+    popkv_score_gqa_tiled_kernel<G_DIM, TILE_TOKENS><<<blocks, 256, shared_bytes, stream>>>(
+        k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+        reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()),
+        q_sign.data_ptr<int32_t>(), q_mag.data_ptr<int32_t>(), q_low.data_ptr<float>(),
+        q_delta.data_ptr<float>(), head_to_kv.data_ptr<int64_t>(),
+        reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),
+        batch, q_heads, kv_heads, k_sign.size(1), tokens);
+}
+
 template <typename scalar_t, int G_DIM>
 __global__ void popkv_query_encode_dim_kernel(
     const scalar_t* __restrict__ queries, int32_t* __restrict__ q_sign,
@@ -979,11 +1213,24 @@ torch::Tensor popkv_score_cuda(
     CHECK_CUDA(k_sign); CHECK_CUDA(k_mag); CHECK_CUDA(low_mean); CHECK_CUDA(delta_mean);
     CHECK_CUDA(head_to_kv); CHECK_CONTIGUOUS(head_to_kv);
     CHECK_INT32(k_sign); CHECK_INT32(k_mag);
+    TORCH_CHECK(low_mean.scalar_type() == at::kHalf && delta_mean.scalar_type() == at::kHalf,
+                "Pop-KV representative metadata must be float16");
     TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
     c10::cuda::CUDAGuard guard(queries.device());
     int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
-    int64_t capacity = k_sign.size(1), words = k_sign.size(2);
+    int64_t capacity = k_sign.size(1), words = k_sign.size(2), kv_heads = k_sign.size(0);
     TORCH_CHECK(tokens > 0 && tokens <= capacity, "invalid score token count");
+    TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
+    TORCH_CHECK(q_heads % kv_heads == 0, "GQA query heads must be divisible by KV heads");
+    if (head_dim == 128 && words == 4) {
+        auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_gqa_tiled_g32", [&] {
+            launch_popkv_score_gqa_tiled<scalar_t, 32>(
+                queries, k_sign, k_mag, low_mean, delta_mean, head_to_kv, scores);
+        });
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return scores;
+    }
     auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat32));
     size_t shared = static_cast<size_t>(4 * words) * sizeof(uint32_t);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_cuda", [&] {
@@ -1018,29 +1265,37 @@ torch::Tensor popkv_score_dim_cuda(
     int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
     int64_t capacity = k_sign.size(1), words = (head_dim + 31) / 32;
     int64_t reps = (head_dim + dim_group_size - 1) / dim_group_size;
-    TORCH_CHECK(!use_uint64_popcount || (head_dim == 128 && words == 4 && reps == 2),
-                "G64 uint64 popcount kernel requires head_dim=128");
+    int64_t kv_heads = k_sign.size(0);
     TORCH_CHECK(tokens > 0 && tokens <= capacity, "invalid score token count");
     TORCH_CHECK(k_sign.size(2) == words && k_mag.sizes().vec() == k_sign.sizes().vec(),
                 "packed bitplane shape mismatch");
-    TORCH_CHECK(low_mean.size(0) == k_sign.size(0) && low_mean.size(1) == capacity &&
+    TORCH_CHECK(low_mean.size(0) == kv_heads && low_mean.size(1) == capacity &&
                 low_mean.size(2) == reps && delta_mean.sizes().vec() == low_mean.sizes().vec(),
                 "representative metadata shape mismatch");
     TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
+    TORCH_CHECK(q_heads % kv_heads == 0, "GQA query heads must be divisible by KV heads");
     TORCH_CHECK(k_sign.device() == queries.device() && k_mag.device() == queries.device() &&
                 low_mean.device() == queries.device() && delta_mean.device() == queries.device() &&
                 head_to_kv.device() == queries.device(), "score tensors must share a CUDA device");
+    if (head_dim == 128 && words == 4 && (dim_group_size == 16 || dim_group_size == 64)) {
+        auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_gqa_tiled_dim", [&] {
+            if (dim_group_size == 16) {
+                launch_popkv_score_gqa_tiled<scalar_t, 16>(
+                    queries, k_sign, k_mag, low_mean, delta_mean, head_to_kv, scores);
+            } else {
+                launch_popkv_score_gqa_tiled<scalar_t, 64>(
+                    queries, k_sign, k_mag, low_mean, delta_mean, head_to_kv, scores);
+            }
+        });
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return scores;
+    }
     auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat32));
     size_t shared = static_cast<size_t>(2 * words + 2 * reps) * sizeof(uint32_t);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_dim_cuda", [&] {
         if (dim_group_size == 16) {
             popkv_score_dim_kernel<scalar_t, 16, false><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
-                queries.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
-                reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
-                reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()), head_to_kv.data_ptr<int64_t>(),
-                scores.data_ptr<float>(), batch, q_heads, capacity, tokens, words, reps, head_dim);
-        } else if (use_uint64_popcount) {
-            popkv_score_dim_kernel<scalar_t, 64, true><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
                 queries.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
                 reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
                 reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()), head_to_kv.data_ptr<int64_t>(),
@@ -1100,4 +1355,239 @@ void popkv_query_encode_out_cuda(
         }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Authors-style FIER layout: one uint32 encodes 32 tokens and head_dim is the
+// contiguous inner dimension, i.e. packed[KVH, token_word, D].  For 1-bit RTN,
+// zero=min and scale=max-min reconstruct the two group representatives.
+template <typename scalar_t>
+__global__ void fier_author_update_kernel(
+    const scalar_t* __restrict__ keys, int32_t* __restrict__ packed,
+    scalar_t* __restrict__ group_zero, scalar_t* __restrict__ group_scale,
+    int64_t tokens, int64_t head_dim, int64_t storage_words,
+    int64_t storage_groups, int64_t word, int64_t group) {
+    int64_t kvh = blockIdx.x;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float lo = load_as_float(keys, (kvh * tokens) * head_dim + d);
+        float hi = lo;
+        for (int64_t t = 1; t < tokens; ++t) {
+            float value = load_as_float(keys, (kvh * tokens + t) * head_dim + d);
+            lo = fminf(lo, value); hi = fmaxf(hi, value);
+        }
+        uint32_t bits = 0;
+        float threshold = (lo + hi) * 0.5f;
+        for (int64_t t = 0; t < tokens; ++t) {
+            float value = load_as_float(keys, (kvh * tokens + t) * head_dim + d);
+            // torch.round uses ties-to-even, so the exact midpoint maps to zero.
+            if (value > threshold) bits |= (uint32_t(1) << t);
+        }
+        packed[(kvh * storage_words + word) * head_dim + d] = static_cast<int32_t>(bits);
+        int64_t meta = (kvh * storage_groups + group) * head_dim + d;
+        group_zero[meta] = static_cast<scalar_t>(lo);
+        group_scale[meta] = static_cast<scalar_t>(hi - lo);
+    }
+}
+
+template <typename scalar_t>
+__global__ void fier_author_score_kernel(
+    const scalar_t* __restrict__ queries,
+    const int32_t* __restrict__ packed,
+    const scalar_t* __restrict__ group_zero,
+    const scalar_t* __restrict__ group_scale,
+    const int64_t* __restrict__ head_to_kv,
+    __half* __restrict__ scores,
+    int64_t q_heads, int64_t head_dim, int64_t storage_words,
+    int64_t storage_groups, int64_t output_tokens) {
+    int64_t row = blockIdx.x;
+    int64_t qh = row % q_heads;
+    int64_t kvh = head_to_kv[qh];
+    int lane = threadIdx.x;
+    int warp = threadIdx.y;
+    int64_t word = static_cast<int64_t>(blockIdx.y) * blockDim.y + warp;
+    float partial[32] = {};
+
+    if (word < storage_words && word < storage_groups && word * 32 < output_tokens) {
+        int64_t q_base = row * head_dim;
+        int64_t packed_base = (kvh * storage_words + word) * head_dim;
+        int64_t meta_base = (kvh * storage_groups + word) * head_dim;
+        for (int64_t d = lane; d < head_dim; d += 32) {
+            uint32_t bits = static_cast<uint32_t>(packed[packed_base + d]);
+            float q = load_as_float(queries, q_base + d);
+            float zero = load_as_float(group_zero, meta_base + d);
+            float scale = load_as_float(group_scale, meta_base + d);
+#pragma unroll
+            for (int token_lane = 0; token_lane < 32; ++token_lane) {
+                float quantized = static_cast<float>((bits >> token_lane) & 1u);
+                partial[token_lane] = fmaf(q, fmaf(scale, quantized, zero), partial[token_lane]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int token_lane = 0; token_lane < 32; ++token_lane) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial[token_lane] += __shfl_down_sync(0xffffffffu, partial[token_lane], offset);
+        int64_t token = word * 32 + token_lane;
+        if (lane == 0 && token < output_tokens)
+            scores[row * output_tokens + token] = __float2half_rn(partial[token_lane]);
+    }
+}
+
+void fier_author_update_cuda(
+    torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero,
+    torch::Tensor group_scale, int64_t token_offset) {
+    CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
+    CHECK_CUDA(packed); CHECK_CONTIGUOUS(packed); CHECK_INT32(packed);
+    CHECK_CUDA(group_zero); CHECK_CUDA(group_scale);
+    CHECK_CONTIGUOUS(group_zero); CHECK_CONTIGUOUS(group_scale);
+    TORCH_CHECK(keys.dim() == 3 && keys.size(1) > 0 && keys.size(1) <= 32,
+                "active author FIER keys must contain 1..32 tokens");
+    TORCH_CHECK(group_zero.scalar_type() == keys.scalar_type() &&
+                group_scale.scalar_type() == keys.scalar_type(),
+                "author FIER metadata dtype must match keys");
+    TORCH_CHECK(packed.dim() == 3 && packed.size(0) == keys.size(0) &&
+                packed.size(2) == keys.size(2), "author FIER packed shape mismatch");
+    TORCH_CHECK(group_zero.sizes() == group_scale.sizes() && group_zero.dim() == 3 &&
+                group_zero.size(0) == keys.size(0) && group_zero.size(2) == keys.size(2),
+                "author FIER metadata shape mismatch");
+    int64_t word = token_offset / 32, group = word;
+    TORCH_CHECK(token_offset >= 0 && token_offset % 32 == 0 &&
+                word < packed.size(1) && group < group_zero.size(1),
+                "author FIER token offset out of bounds");
+    c10::cuda::CUDAGuard guard(keys.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_author_update_cuda", [&] {
+        fier_author_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
+            keys.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
+            group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
+            keys.size(1), keys.size(2), packed.size(1), group_zero.size(1), word, group);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fier_author_score_cuda(
+    torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
+    torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens) {
+    CHECK_CUDA(queries); CHECK_CONTIGUOUS(queries); CHECK_FLOATISH(queries);
+    CHECK_CUDA(packed); CHECK_CONTIGUOUS(packed); CHECK_INT32(packed);
+    CHECK_CUDA(group_zero); CHECK_CUDA(group_scale);
+    CHECK_CONTIGUOUS(group_zero); CHECK_CONTIGUOUS(group_scale);
+    CHECK_CUDA(head_to_kv); CHECK_CONTIGUOUS(head_to_kv);
+    TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
+    int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
+    TORCH_CHECK(queries.dim() == 3 && packed.dim() == 3 && group_zero.dim() == 3,
+                "invalid author FIER tensor ranks");
+    TORCH_CHECK(packed.size(2) == head_dim && group_zero.size(2) == head_dim &&
+                group_zero.sizes() == group_scale.sizes(), "author FIER shape mismatch");
+    TORCH_CHECK(group_zero.scalar_type() == queries.scalar_type() &&
+                group_scale.scalar_type() == queries.scalar_type(),
+                "author FIER query/metadata dtype mismatch");
+    TORCH_CHECK(tokens > 0 && tokens <= packed.size(1) * 32 &&
+                (tokens + 31) / 32 <= group_zero.size(1), "invalid author FIER token count");
+    TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
+    auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
+    int64_t used_words = (tokens + 31) / 32;
+    dim3 blocks(batch * q_heads, (used_words + 3) / 4);
+    dim3 threads(32, 4);
+    c10::cuda::CUDAGuard guard(queries.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "fier_author_score_cuda", [&] {
+        fier_author_score_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            queries.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
+            group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
+            head_to_kv.data_ptr<int64_t>(), reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),
+            q_heads, head_dim, packed.size(1), group_zero.size(1), tokens);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return scores;
+}
+
+
+template <int G_DIM>
+static void launch_popkv_score_encoded_gqa_tiled(
+    torch::Tensor q_sign, torch::Tensor q_mag,
+    torch::Tensor q_low, torch::Tensor q_delta,
+    torch::Tensor k_sign, torch::Tensor k_mag,
+    torch::Tensor low_mean, torch::Tensor delta_mean,
+    torch::Tensor head_to_kv, torch::Tensor scores) {
+    constexpr int WORDS = 4;
+    constexpr int REPS = 128 / G_DIM;
+    int64_t batch = q_sign.size(0), q_heads = q_sign.size(1);
+    int64_t kv_heads = k_sign.size(0), tokens = scores.size(2);
+    constexpr int TILE_TOKENS = 1024;
+    dim3 blocks(batch * kv_heads, (tokens + TILE_TOKENS - 1) / TILE_TOKENS);
+    size_t shared_bytes = static_cast<size_t>(q_heads / kv_heads) *
+        (2 * WORDS * sizeof(uint32_t) + 2 * REPS * sizeof(float));
+    popkv_score_gqa_tiled_kernel<G_DIM, TILE_TOKENS><<<
+        blocks, 256, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+        reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()),
+        q_sign.data_ptr<int32_t>(), q_mag.data_ptr<int32_t>(),
+        q_low.data_ptr<float>(), q_delta.data_ptr<float>(),
+        head_to_kv.data_ptr<int64_t>(),
+        reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),
+        batch, q_heads, kv_heads, k_sign.size(1), tokens);
+}
+torch::Tensor popkv_score_encoded_cuda(
+    torch::Tensor q_sign, torch::Tensor q_mag,
+    torch::Tensor q_low, torch::Tensor q_delta,
+    torch::Tensor k_sign, torch::Tensor k_mag,
+    torch::Tensor low_mean, torch::Tensor delta_mean,
+    torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size) {
+    CHECK_CUDA(q_sign); CHECK_CUDA(q_mag); CHECK_CUDA(q_low); CHECK_CUDA(q_delta);
+    CHECK_CUDA(k_sign); CHECK_CUDA(k_mag); CHECK_CUDA(low_mean); CHECK_CUDA(delta_mean);
+    CHECK_CUDA(head_to_kv);
+    CHECK_CONTIGUOUS(q_sign); CHECK_CONTIGUOUS(q_mag);
+    CHECK_CONTIGUOUS(q_low); CHECK_CONTIGUOUS(q_delta);
+    CHECK_CONTIGUOUS(k_sign); CHECK_CONTIGUOUS(k_mag);
+    CHECK_CONTIGUOUS(low_mean); CHECK_CONTIGUOUS(delta_mean);
+    CHECK_CONTIGUOUS(head_to_kv);
+    CHECK_INT32(q_sign); CHECK_INT32(q_mag); CHECK_INT32(k_sign); CHECK_INT32(k_mag);
+    TORCH_CHECK(q_low.scalar_type() == at::kFloat && q_delta.scalar_type() == at::kFloat,
+                "encoded Pop-KV query representatives must be float32");
+    TORCH_CHECK(low_mean.scalar_type() == at::kHalf && delta_mean.scalar_type() == at::kHalf,
+                "Pop-KV key representatives must be float16");
+    TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
+    TORCH_CHECK(dim_group_size == 16 || dim_group_size == 32 || dim_group_size == 64,
+                "dim_group_size must be 16, 32, or 64");
+    TORCH_CHECK(q_sign.dim() == 3 && q_sign.size(2) == 4 && q_mag.sizes() == q_sign.sizes(),
+                "encoded Pop-KV query bitplanes must be [batch, query heads, 4]");
+    int64_t batch = q_sign.size(0), q_heads = q_sign.size(1);
+    int64_t reps = 128 / dim_group_size, kv_heads = k_sign.size(0);
+    TORCH_CHECK(q_low.sizes() == q_delta.sizes() && q_low.dim() == 3 &&
+                q_low.size(0) == batch && q_low.size(1) == q_heads && q_low.size(2) == reps,
+                "encoded Pop-KV query representative shape mismatch");
+    TORCH_CHECK(k_sign.dim() == 3 && k_sign.size(2) == 4 && k_mag.sizes() == k_sign.sizes(),
+                "Pop-KV key bitplanes must be [KV heads, capacity, 4]");
+    TORCH_CHECK(low_mean.sizes() == delta_mean.sizes() && low_mean.dim() == 3 &&
+                low_mean.size(0) == kv_heads && low_mean.size(1) == k_sign.size(1) &&
+                low_mean.size(2) == reps, "Pop-KV key representative shape mismatch");
+    TORCH_CHECK(tokens > 0 && tokens <= k_sign.size(1), "invalid score token count");
+    TORCH_CHECK(head_to_kv.numel() == q_heads && q_heads % kv_heads == 0,
+                "invalid GQA head mapping");
+    TORCH_CHECK(q_sign.device() == k_sign.device() && q_mag.device() == k_sign.device() &&
+                q_low.device() == k_sign.device() && q_delta.device() == k_sign.device() &&
+                k_mag.device() == k_sign.device() && low_mean.device() == k_sign.device() &&
+                delta_mean.device() == k_sign.device() && head_to_kv.device() == k_sign.device(),
+                "encoded score tensors must share a CUDA device");
+    c10::cuda::CUDAGuard guard(k_sign.device());
+    auto scores = torch::empty({batch, q_heads, tokens},
+                               low_mean.options().dtype(torch::kFloat16));
+    if (dim_group_size == 16) {
+        launch_popkv_score_encoded_gqa_tiled<16>(
+            q_sign, q_mag, q_low, q_delta, k_sign, k_mag, low_mean, delta_mean,
+            head_to_kv, scores);
+    } else if (dim_group_size == 32) {
+        launch_popkv_score_encoded_gqa_tiled<32>(
+            q_sign, q_mag, q_low, q_delta, k_sign, k_mag, low_mean, delta_mean,
+            head_to_kv, scores);
+    } else {
+        launch_popkv_score_encoded_gqa_tiled<64>(
+            q_sign, q_mag, q_low, q_delta, k_sign, k_mag, low_mean, delta_mean,
+            head_to_kv, scores);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return scores;
 }

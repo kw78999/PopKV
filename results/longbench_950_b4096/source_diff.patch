@@ -1,0 +1,1512 @@
+diff --git a/csrc/popkv_ext.cpp b/csrc/popkv_ext.cpp
+index 79ebdc4..9a82bcf 100644
+--- a/csrc/popkv_ext.cpp
++++ b/csrc/popkv_ext.cpp
+@@ -2,6 +2,10 @@
+ 
+ void quest_update_cuda(torch::Tensor keys, torch::Tensor page_min, torch::Tensor page_max, int64_t page);
+ void fier_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min, torch::Tensor group_max, int64_t token_offset);
++void fier_author_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero, torch::Tensor group_scale, int64_t token_offset);
++torch::Tensor fier_author_score_cuda(
++    torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
++    torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens);
+ std::vector<torch::Tensor> popkv_pack_cuda(
+     torch::Tensor keys, int64_t token_capacity, int64_t token_group_size);
+ void popkv_pack_into_cuda(
+@@ -27,10 +31,16 @@ torch::Tensor popkv_score_dim_cuda(
+     torch::Tensor low_mean, torch::Tensor delta_mean,
+     torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size,
+     bool use_uint64_popcount);
++torch::Tensor popkv_score_encoded_cuda(
++    torch::Tensor q_sign, torch::Tensor q_mag, torch::Tensor q_low, torch::Tensor q_delta,
++    torch::Tensor k_sign, torch::Tensor k_mag, torch::Tensor low_mean, torch::Tensor delta_mean,
++    torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size);
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("quest_update", &quest_update_cuda);
+     m.def("fier_update", &fier_update_cuda);
++    m.def("fier_author_update", &fier_author_update_cuda);
++    m.def("fier_author_score", &fier_author_score_cuda);
+     m.def("pack", &popkv_pack_cuda);
+     m.def("pack_into", &popkv_pack_into_cuda);
+     m.def("score", &popkv_score_cuda);
+@@ -38,4 +48,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("pack_dim", &popkv_pack_dim_cuda);
+     m.def("pack_into_dim", &popkv_pack_into_dim_cuda);
+     m.def("score_dim", &popkv_score_dim_cuda);
++    m.def("score_encoded", &popkv_score_encoded_cuda);
+ }
+diff --git a/csrc/popkv_ext.cu b/csrc/popkv_ext.cu
+index 1fcbe1a..3fea778 100644
+--- a/csrc/popkv_ext.cu
++++ b/csrc/popkv_ext.cu
+@@ -674,6 +674,240 @@ __global__ void popkv_score_dim_kernel(
+     }
+ }
+ 
++// Llama head_dim=128 production path. Query encoding is performed once per
++// query head, then token-tiled CTAs share each compressed K record across all
++// query heads mapped to the same GQA KV head. The existing token-major cache
++// permits aligned uint2 bitplane loads and half2 representative loads without
++// changing the cache footprint.
++template <typename scalar_t, int G_DIM>
++__global__ void popkv_query_encode_warp_kernel(
++    const scalar_t* __restrict__ queries, int32_t* __restrict__ q_sign_out,
++    int32_t* __restrict__ q_mag_out, float* __restrict__ q_low_out,
++    float* __restrict__ q_delta_out, int64_t rows) {
++    constexpr int WORDS = 4;
++    constexpr int REPS = 128 / G_DIM;
++    int64_t row = blockIdx.x;
++    int lane = threadIdx.x;
++    if (row >= rows) return;
++    int64_t q_base = row * 128;
++
++    float local_min = INFINITY, local_max = -INFINITY;
++#pragma unroll
++    for (int d = lane; d < 128; d += 32) {
++        float value = load_as_float(queries, q_base + d);
++        local_min = fminf(local_min, value);
++        local_max = fmaxf(local_max, value);
++    }
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        local_min = fminf(local_min, __shfl_down_sync(0xffffffffu, local_min, offset));
++        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, offset));
++    }
++    float min_v = __shfl_sync(0xffffffffu, local_min, 0);
++    float max_v = __shfl_sync(0xffffffffu, local_max, 0);
++    float neg = min_v * 0.5f, pos = max_v * 0.5f;
++
++#pragma unroll
++    for (int word = 0; word < WORDS; ++word) {
++        float value = load_as_float(queries, q_base + word * 32 + lane);
++        bool sign = value >= 0.0f;
++        bool mag = sign ? (value > pos) : (value < neg);
++        uint32_t sign_word = __ballot_sync(0xffffffffu, sign);
++        uint32_t mag_word = __ballot_sync(0xffffffffu, mag);
++        if (lane == 0) {
++            q_sign_out[row * WORDS + word] = static_cast<int32_t>(sign_word);
++            q_mag_out[row * WORDS + word] = static_cast<int32_t>(mag_word);
++        }
++    }
++
++#pragma unroll
++    for (int rep = 0; rep < REPS; ++rep) {
++        float low_sum = 0.0f, high_sum = 0.0f;
++        int low_count = 0, high_count = 0;
++#pragma unroll
++        for (int local = lane; local < G_DIM; local += 32) {
++            float value = load_as_float(queries, q_base + rep * G_DIM + local);
++            bool sign = value >= 0.0f;
++            bool mag = sign ? (value > pos) : (value < neg);
++            if (mag) { high_sum += fabsf(value); ++high_count; }
++            else { low_sum += fabsf(value); ++low_count; }
++        }
++#pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            low_sum += __shfl_down_sync(0xffffffffu, low_sum, offset);
++            high_sum += __shfl_down_sync(0xffffffffu, high_sum, offset);
++            low_count += __shfl_down_sync(0xffffffffu, low_count, offset);
++            high_count += __shfl_down_sync(0xffffffffu, high_count, offset);
++        }
++        if (lane == 0) {
++            float low, high;
++            if (low_count == 0) {
++                low = high_count ? high_sum / high_count : 0.0f;
++                high = low;
++            } else {
++                low = low_sum / low_count;
++                high = high_count ? high_sum / high_count : low;
++            }
++            q_low_out[row * REPS + rep] = low;
++            q_delta_out[row * REPS + rep] = high - low;
++        }
++    }
++}
++
++template <int G_DIM, int TILE_TOKENS = 1024>
++__global__ void popkv_score_gqa_tiled_kernel(
++    const int32_t* __restrict__ k_sign, const int32_t* __restrict__ k_mag,
++    const __half* __restrict__ k_low, const __half* __restrict__ k_delta,
++    const int32_t* __restrict__ q_sign, const int32_t* __restrict__ q_mag,
++    const float* __restrict__ q_low, const float* __restrict__ q_delta,
++    const int64_t* __restrict__ head_to_kv, __half* __restrict__ scores,
++    int64_t batch, int64_t q_heads,
++    int64_t kv_heads, int64_t token_capacity, int64_t output_tokens) {
++    constexpr int WORDS = 4;
++    constexpr int REPS = 128 / G_DIM;
++    int64_t group_row = blockIdx.x;
++    int64_t batch_idx = group_row / kv_heads;
++    int64_t kv_slot = group_row % kv_heads;
++    int64_t q_per_kv = q_heads / kv_heads;
++    int64_t qh_start = kv_slot * q_per_kv;
++    int64_t query_row_start = batch_idx * q_heads + qh_start;
++    int64_t kvh = head_to_kv[qh_start];
++    int64_t tile_start = static_cast<int64_t>(blockIdx.y) * TILE_TOKENS;
++    float norm = rsqrtf(128.0f);
++    extern __shared__ unsigned char query_shared_raw[];
++    uint32_t* shared_q_sign = reinterpret_cast<uint32_t*>(query_shared_raw);
++    uint32_t* shared_q_mag = shared_q_sign + q_per_kv * WORDS;
++    float* shared_q_low = reinterpret_cast<float*>(shared_q_mag + q_per_kv * WORDS);
++    float* shared_q_delta = shared_q_low + q_per_kv * REPS;
++    int query_items = static_cast<int>(q_per_kv) * (2 * WORDS + 2 * REPS);
++    for (int item = threadIdx.x; item < query_items; item += blockDim.x) {
++        int plane_words = static_cast<int>(q_per_kv) * WORDS;
++        int rep_values = static_cast<int>(q_per_kv) * REPS;
++        if (item < plane_words)
++            shared_q_sign[item] = static_cast<uint32_t>(q_sign[query_row_start * WORDS + item]);
++        else if (item < 2 * plane_words) {
++            int offset = item - plane_words;
++            shared_q_mag[offset] = static_cast<uint32_t>(q_mag[query_row_start * WORDS + offset]);
++        } else if (item < 2 * plane_words + rep_values) {
++            int offset = item - 2 * plane_words;
++            shared_q_low[offset] = q_low[query_row_start * REPS + offset];
++        } else {
++            int offset = item - 2 * plane_words - rep_values;
++            shared_q_delta[offset] = q_delta[query_row_start * REPS + offset];
++        }
++    }
++    __syncthreads();
++
++    for (int local_token = threadIdx.x; local_token < TILE_TOKENS;
++         local_token += blockDim.x) {
++        int64_t token = tile_start + local_token;
++        if (token >= output_tokens) continue;
++        int64_t bit_base = (kvh * token_capacity + token) * WORDS;
++        int64_t rep_base = (kvh * token_capacity + token) * REPS;
++
++        uint32_t ks[WORDS], km[WORDS];
++        const uint2* sign_vec = reinterpret_cast<const uint2*>(k_sign + bit_base);
++        const uint2* mag_vec = reinterpret_cast<const uint2*>(k_mag + bit_base);
++        uint2 ks01 = sign_vec[0], ks23 = sign_vec[1];
++        uint2 km01 = mag_vec[0], km23 = mag_vec[1];
++        ks[0] = ks01.x; ks[1] = ks01.y; ks[2] = ks23.x; ks[3] = ks23.y;
++        km[0] = km01.x; km[1] = km01.y; km[2] = km23.x; km[3] = km23.y;
++
++        float kl[REPS], dk[REPS];
++#pragma unroll
++        for (int pair = 0; pair < REPS / 2; ++pair) {
++            float2 lows = __half22float2(reinterpret_cast<const __half2*>(k_low + rep_base)[pair]);
++            float2 deltas = __half22float2(reinterpret_cast<const __half2*>(k_delta + rep_base)[pair]);
++            kl[2 * pair] = lows.x; kl[2 * pair + 1] = lows.y;
++            dk[2 * pair] = deltas.x; dk[2 * pair + 1] = deltas.y;
++        }
++
++        for (int64_t q_local = 0; q_local < q_per_kv; ++q_local) {
++            int64_t qh = qh_start + q_local;
++            int64_t row = batch_idx * q_heads + qh;
++            int64_t q_bit_base = q_local * WORDS;
++            int64_t q_rep_base = q_local * REPS;
++            float total = 0.0f;
++            if constexpr (G_DIM == 16) {
++#pragma unroll
++                for (int rep = 0; rep < REPS; ++rep) {
++                    int word = rep / 2;
++                    uint32_t mask = (rep & 1) ? 0xffff0000u : 0x0000ffffu;
++                    total += popkv_reconstruct_u32(
++                        shared_q_sign[q_bit_base + word],
++                        shared_q_mag[q_bit_base + word],
++                        ks[word], km[word], mask, shared_q_low[q_rep_base + rep],
++                        shared_q_delta[q_rep_base + rep], kl[rep], dk[rep]);
++                }
++            } else if constexpr (G_DIM == 32) {
++#pragma unroll
++                for (int rep = 0; rep < REPS; ++rep) {
++                    total += popkv_reconstruct_u32(
++                        shared_q_sign[q_bit_base + rep],
++                        shared_q_mag[q_bit_base + rep],
++                        ks[rep], km[rep], 0xffffffffu, shared_q_low[q_rep_base + rep],
++                        shared_q_delta[q_rep_base + rep], kl[rep], dk[rep]);
++                }
++            } else {
++#pragma unroll
++                for (int rep = 0; rep < REPS; ++rep) {
++                    int c_sign = 0, c_q = 0, c_k = 0, c_qk = 0;
++#pragma unroll
++                    for (int half = 0; half < 2; ++half) {
++                        int word = 2 * rep + half;
++                        uint32_t qm = shared_q_mag[q_bit_base + word];
++                        uint32_t match = ~(shared_q_sign[q_bit_base + word] ^ ks[word]);
++                        uint32_t both = qm & km[word];
++                        c_sign += 2 * __popc(match) - 32;
++                        c_q += 2 * __popc(match & qm) - __popc(qm);
++                        c_k += 2 * __popc(match & km[word]) - __popc(km[word]);
++                        c_qk += 2 * __popc(match & both) - __popc(both);
++                    }
++                    float ql = shared_q_low[q_rep_base + rep], dq = shared_q_delta[q_rep_base + rep];
++                    total += fmaf(ql * kl[rep], static_cast<float>(c_sign),
++                        fmaf(dq * kl[rep], static_cast<float>(c_q),
++                        fmaf(ql * dk[rep], static_cast<float>(c_k),
++                             dq * dk[rep] * static_cast<float>(c_qk))));
++                }
++            }
++            scores[row * output_tokens + token] = __float2half_rn(total * norm);
++        }
++    }
++}
++
++template <typename scalar_t, int G_DIM>
++static void launch_popkv_score_gqa_tiled(
++    torch::Tensor queries, torch::Tensor k_sign, torch::Tensor k_mag,
++    torch::Tensor low_mean, torch::Tensor delta_mean, torch::Tensor head_to_kv,
++    torch::Tensor scores) {
++    constexpr int WORDS = 4;
++    constexpr int REPS = 128 / G_DIM;
++    int64_t batch = queries.size(0), q_heads = queries.size(1);
++    int64_t kv_heads = k_sign.size(0), tokens = scores.size(2);
++    auto int_options = queries.options().dtype(torch::kInt32);
++    auto float_options = queries.options().dtype(torch::kFloat32);
++    auto q_sign = torch::empty({batch, q_heads, WORDS}, int_options);
++    auto q_mag = torch::empty_like(q_sign);
++    auto q_low = torch::empty({batch, q_heads, REPS}, float_options);
++    auto q_delta = torch::empty_like(q_low);
++    auto stream = at::cuda::getCurrentCUDAStream();
++    popkv_query_encode_warp_kernel<scalar_t, G_DIM><<<batch * q_heads, 32, 0, stream>>>(
++        queries.data_ptr<scalar_t>(), q_sign.data_ptr<int32_t>(), q_mag.data_ptr<int32_t>(),
++        q_low.data_ptr<float>(), q_delta.data_ptr<float>(), batch * q_heads);
++    constexpr int TILE_TOKENS = 1024;
++    dim3 blocks(batch * kv_heads, (tokens + TILE_TOKENS - 1) / TILE_TOKENS);
++    size_t shared_bytes = static_cast<size_t>(q_heads / kv_heads) *
++        (2 * WORDS * sizeof(uint32_t) + 2 * REPS * sizeof(float));
++    popkv_score_gqa_tiled_kernel<G_DIM, TILE_TOKENS><<<blocks, 256, shared_bytes, stream>>>(
++        k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
++        reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
++        reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()),
++        q_sign.data_ptr<int32_t>(), q_mag.data_ptr<int32_t>(), q_low.data_ptr<float>(),
++        q_delta.data_ptr<float>(), head_to_kv.data_ptr<int64_t>(),
++        reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),
++        batch, q_heads, kv_heads, k_sign.size(1), tokens);
++}
++
+ template <typename scalar_t, int G_DIM>
+ __global__ void popkv_query_encode_dim_kernel(
+     const scalar_t* __restrict__ queries, int32_t* __restrict__ q_sign,
+@@ -979,11 +1213,24 @@ torch::Tensor popkv_score_cuda(
+     CHECK_CUDA(k_sign); CHECK_CUDA(k_mag); CHECK_CUDA(low_mean); CHECK_CUDA(delta_mean);
+     CHECK_CUDA(head_to_kv); CHECK_CONTIGUOUS(head_to_kv);
+     CHECK_INT32(k_sign); CHECK_INT32(k_mag);
++    TORCH_CHECK(low_mean.scalar_type() == at::kHalf && delta_mean.scalar_type() == at::kHalf,
++                "Pop-KV representative metadata must be float16");
+     TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
+     c10::cuda::CUDAGuard guard(queries.device());
+     int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
+-    int64_t capacity = k_sign.size(1), words = k_sign.size(2);
++    int64_t capacity = k_sign.size(1), words = k_sign.size(2), kv_heads = k_sign.size(0);
+     TORCH_CHECK(tokens > 0 && tokens <= capacity, "invalid score token count");
++    TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
++    TORCH_CHECK(q_heads % kv_heads == 0, "GQA query heads must be divisible by KV heads");
++    if (head_dim == 128 && words == 4) {
++        auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
++        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_gqa_tiled_g32", [&] {
++            launch_popkv_score_gqa_tiled<scalar_t, 32>(
++                queries, k_sign, k_mag, low_mean, delta_mean, head_to_kv, scores);
++        });
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        return scores;
++    }
+     auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat32));
+     size_t shared = static_cast<size_t>(4 * words) * sizeof(uint32_t);
+     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_cuda", [&] {
+@@ -1018,18 +1265,32 @@ torch::Tensor popkv_score_dim_cuda(
+     int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
+     int64_t capacity = k_sign.size(1), words = (head_dim + 31) / 32;
+     int64_t reps = (head_dim + dim_group_size - 1) / dim_group_size;
+-    TORCH_CHECK(!use_uint64_popcount || (head_dim == 128 && words == 4 && reps == 2),
+-                "G64 uint64 popcount kernel requires head_dim=128");
++    int64_t kv_heads = k_sign.size(0);
+     TORCH_CHECK(tokens > 0 && tokens <= capacity, "invalid score token count");
+     TORCH_CHECK(k_sign.size(2) == words && k_mag.sizes().vec() == k_sign.sizes().vec(),
+                 "packed bitplane shape mismatch");
+-    TORCH_CHECK(low_mean.size(0) == k_sign.size(0) && low_mean.size(1) == capacity &&
++    TORCH_CHECK(low_mean.size(0) == kv_heads && low_mean.size(1) == capacity &&
+                 low_mean.size(2) == reps && delta_mean.sizes().vec() == low_mean.sizes().vec(),
+                 "representative metadata shape mismatch");
+     TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
++    TORCH_CHECK(q_heads % kv_heads == 0, "GQA query heads must be divisible by KV heads");
+     TORCH_CHECK(k_sign.device() == queries.device() && k_mag.device() == queries.device() &&
+                 low_mean.device() == queries.device() && delta_mean.device() == queries.device() &&
+                 head_to_kv.device() == queries.device(), "score tensors must share a CUDA device");
++    if (head_dim == 128 && words == 4 && (dim_group_size == 16 || dim_group_size == 64)) {
++        auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
++        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_gqa_tiled_dim", [&] {
++            if (dim_group_size == 16) {
++                launch_popkv_score_gqa_tiled<scalar_t, 16>(
++                    queries, k_sign, k_mag, low_mean, delta_mean, head_to_kv, scores);
++            } else {
++                launch_popkv_score_gqa_tiled<scalar_t, 64>(
++                    queries, k_sign, k_mag, low_mean, delta_mean, head_to_kv, scores);
++            }
++        });
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        return scores;
++    }
+     auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat32));
+     size_t shared = static_cast<size_t>(2 * words + 2 * reps) * sizeof(uint32_t);
+     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "popkv_score_dim_cuda", [&] {
+@@ -1039,12 +1300,6 @@ torch::Tensor popkv_score_dim_cuda(
+                 reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
+                 reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()), head_to_kv.data_ptr<int64_t>(),
+                 scores.data_ptr<float>(), batch, q_heads, capacity, tokens, words, reps, head_dim);
+-        } else if (use_uint64_popcount) {
+-            popkv_score_dim_kernel<scalar_t, 64, true><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
+-                queries.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+-                reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
+-                reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()), head_to_kv.data_ptr<int64_t>(),
+-                scores.data_ptr<float>(), batch, q_heads, capacity, tokens, words, reps, head_dim);
+         } else {
+             popkv_score_dim_kernel<scalar_t, 64, false><<<batch * q_heads, 256, shared, at::cuda::getCurrentCUDAStream()>>>(
+                 queries.data_ptr<scalar_t>(), k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
+@@ -1101,3 +1356,238 @@ void popkv_query_encode_out_cuda(
+     });
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
++
++// Authors-style FIER layout: one uint32 encodes 32 tokens and head_dim is the
++// contiguous inner dimension, i.e. packed[KVH, token_word, D].  For 1-bit RTN,
++// zero=min and scale=max-min reconstruct the two group representatives.
++template <typename scalar_t>
++__global__ void fier_author_update_kernel(
++    const scalar_t* __restrict__ keys, int32_t* __restrict__ packed,
++    scalar_t* __restrict__ group_zero, scalar_t* __restrict__ group_scale,
++    int64_t tokens, int64_t head_dim, int64_t storage_words,
++    int64_t storage_groups, int64_t word, int64_t group) {
++    int64_t kvh = blockIdx.x;
++    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
++        float lo = load_as_float(keys, (kvh * tokens) * head_dim + d);
++        float hi = lo;
++        for (int64_t t = 1; t < tokens; ++t) {
++            float value = load_as_float(keys, (kvh * tokens + t) * head_dim + d);
++            lo = fminf(lo, value); hi = fmaxf(hi, value);
++        }
++        uint32_t bits = 0;
++        float threshold = (lo + hi) * 0.5f;
++        for (int64_t t = 0; t < tokens; ++t) {
++            float value = load_as_float(keys, (kvh * tokens + t) * head_dim + d);
++            // torch.round uses ties-to-even, so the exact midpoint maps to zero.
++            if (value > threshold) bits |= (uint32_t(1) << t);
++        }
++        packed[(kvh * storage_words + word) * head_dim + d] = static_cast<int32_t>(bits);
++        int64_t meta = (kvh * storage_groups + group) * head_dim + d;
++        group_zero[meta] = static_cast<scalar_t>(lo);
++        group_scale[meta] = static_cast<scalar_t>(hi - lo);
++    }
++}
++
++template <typename scalar_t>
++__global__ void fier_author_score_kernel(
++    const scalar_t* __restrict__ queries,
++    const int32_t* __restrict__ packed,
++    const scalar_t* __restrict__ group_zero,
++    const scalar_t* __restrict__ group_scale,
++    const int64_t* __restrict__ head_to_kv,
++    __half* __restrict__ scores,
++    int64_t q_heads, int64_t head_dim, int64_t storage_words,
++    int64_t storage_groups, int64_t output_tokens) {
++    int64_t row = blockIdx.x;
++    int64_t qh = row % q_heads;
++    int64_t kvh = head_to_kv[qh];
++    int lane = threadIdx.x;
++    int warp = threadIdx.y;
++    int64_t word = static_cast<int64_t>(blockIdx.y) * blockDim.y + warp;
++    float partial[32] = {};
++
++    if (word < storage_words && word < storage_groups && word * 32 < output_tokens) {
++        int64_t q_base = row * head_dim;
++        int64_t packed_base = (kvh * storage_words + word) * head_dim;
++        int64_t meta_base = (kvh * storage_groups + word) * head_dim;
++        for (int64_t d = lane; d < head_dim; d += 32) {
++            uint32_t bits = static_cast<uint32_t>(packed[packed_base + d]);
++            float q = load_as_float(queries, q_base + d);
++            float zero = load_as_float(group_zero, meta_base + d);
++            float scale = load_as_float(group_scale, meta_base + d);
++#pragma unroll
++            for (int token_lane = 0; token_lane < 32; ++token_lane) {
++                float quantized = static_cast<float>((bits >> token_lane) & 1u);
++                partial[token_lane] = fmaf(q, fmaf(scale, quantized, zero), partial[token_lane]);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int token_lane = 0; token_lane < 32; ++token_lane) {
++#pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1)
++            partial[token_lane] += __shfl_down_sync(0xffffffffu, partial[token_lane], offset);
++        int64_t token = word * 32 + token_lane;
++        if (lane == 0 && token < output_tokens)
++            scores[row * output_tokens + token] = __float2half_rn(partial[token_lane]);
++    }
++}
++
++void fier_author_update_cuda(
++    torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero,
++    torch::Tensor group_scale, int64_t token_offset) {
++    CHECK_CUDA(keys); CHECK_CONTIGUOUS(keys); CHECK_FLOATISH(keys);
++    CHECK_CUDA(packed); CHECK_CONTIGUOUS(packed); CHECK_INT32(packed);
++    CHECK_CUDA(group_zero); CHECK_CUDA(group_scale);
++    CHECK_CONTIGUOUS(group_zero); CHECK_CONTIGUOUS(group_scale);
++    TORCH_CHECK(keys.dim() == 3 && keys.size(1) > 0 && keys.size(1) <= 32,
++                "active author FIER keys must contain 1..32 tokens");
++    TORCH_CHECK(group_zero.scalar_type() == keys.scalar_type() &&
++                group_scale.scalar_type() == keys.scalar_type(),
++                "author FIER metadata dtype must match keys");
++    TORCH_CHECK(packed.dim() == 3 && packed.size(0) == keys.size(0) &&
++                packed.size(2) == keys.size(2), "author FIER packed shape mismatch");
++    TORCH_CHECK(group_zero.sizes() == group_scale.sizes() && group_zero.dim() == 3 &&
++                group_zero.size(0) == keys.size(0) && group_zero.size(2) == keys.size(2),
++                "author FIER metadata shape mismatch");
++    int64_t word = token_offset / 32, group = word;
++    TORCH_CHECK(token_offset >= 0 && token_offset % 32 == 0 &&
++                word < packed.size(1) && group < group_zero.size(1),
++                "author FIER token offset out of bounds");
++    c10::cuda::CUDAGuard guard(keys.device());
++    auto stream = at::cuda::getCurrentCUDAStream();
++    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, keys.scalar_type(), "fier_author_update_cuda", [&] {
++        fier_author_update_kernel<scalar_t><<<keys.size(0), 256, 0, stream>>>(
++            keys.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
++            group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
++            keys.size(1), keys.size(2), packed.size(1), group_zero.size(1), word, group);
++    });
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++torch::Tensor fier_author_score_cuda(
++    torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
++    torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens) {
++    CHECK_CUDA(queries); CHECK_CONTIGUOUS(queries); CHECK_FLOATISH(queries);
++    CHECK_CUDA(packed); CHECK_CONTIGUOUS(packed); CHECK_INT32(packed);
++    CHECK_CUDA(group_zero); CHECK_CUDA(group_scale);
++    CHECK_CONTIGUOUS(group_zero); CHECK_CONTIGUOUS(group_scale);
++    CHECK_CUDA(head_to_kv); CHECK_CONTIGUOUS(head_to_kv);
++    TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
++    int64_t batch = queries.size(0), q_heads = queries.size(1), head_dim = queries.size(2);
++    TORCH_CHECK(queries.dim() == 3 && packed.dim() == 3 && group_zero.dim() == 3,
++                "invalid author FIER tensor ranks");
++    TORCH_CHECK(packed.size(2) == head_dim && group_zero.size(2) == head_dim &&
++                group_zero.sizes() == group_scale.sizes(), "author FIER shape mismatch");
++    TORCH_CHECK(group_zero.scalar_type() == queries.scalar_type() &&
++                group_scale.scalar_type() == queries.scalar_type(),
++                "author FIER query/metadata dtype mismatch");
++    TORCH_CHECK(tokens > 0 && tokens <= packed.size(1) * 32 &&
++                (tokens + 31) / 32 <= group_zero.size(1), "invalid author FIER token count");
++    TORCH_CHECK(head_to_kv.numel() == q_heads, "head mapping size mismatch");
++    auto scores = torch::empty({batch, q_heads, tokens}, queries.options().dtype(torch::kFloat16));
++    int64_t used_words = (tokens + 31) / 32;
++    dim3 blocks(batch * q_heads, (used_words + 3) / 4);
++    dim3 threads(32, 4);
++    c10::cuda::CUDAGuard guard(queries.device());
++    auto stream = at::cuda::getCurrentCUDAStream();
++    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "fier_author_score_cuda", [&] {
++        fier_author_score_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
++            queries.data_ptr<scalar_t>(), packed.data_ptr<int32_t>(),
++            group_zero.data_ptr<scalar_t>(), group_scale.data_ptr<scalar_t>(),
++            head_to_kv.data_ptr<int64_t>(), reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),
++            q_heads, head_dim, packed.size(1), group_zero.size(1), tokens);
++    });
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return scores;
++}
++
++
++template <int G_DIM>
++static void launch_popkv_score_encoded_gqa_tiled(
++    torch::Tensor q_sign, torch::Tensor q_mag,
++    torch::Tensor q_low, torch::Tensor q_delta,
++    torch::Tensor k_sign, torch::Tensor k_mag,
++    torch::Tensor low_mean, torch::Tensor delta_mean,
++    torch::Tensor head_to_kv, torch::Tensor scores) {
++    constexpr int WORDS = 4;
++    constexpr int REPS = 128 / G_DIM;
++    int64_t batch = q_sign.size(0), q_heads = q_sign.size(1);
++    int64_t kv_heads = k_sign.size(0), tokens = scores.size(2);
++    constexpr int TILE_TOKENS = 1024;
++    dim3 blocks(batch * kv_heads, (tokens + TILE_TOKENS - 1) / TILE_TOKENS);
++    size_t shared_bytes = static_cast<size_t>(q_heads / kv_heads) *
++        (2 * WORDS * sizeof(uint32_t) + 2 * REPS * sizeof(float));
++    popkv_score_gqa_tiled_kernel<G_DIM, TILE_TOKENS><<<
++        blocks, 256, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
++        k_sign.data_ptr<int32_t>(), k_mag.data_ptr<int32_t>(),
++        reinterpret_cast<const __half*>(low_mean.data_ptr<at::Half>()),
++        reinterpret_cast<const __half*>(delta_mean.data_ptr<at::Half>()),
++        q_sign.data_ptr<int32_t>(), q_mag.data_ptr<int32_t>(),
++        q_low.data_ptr<float>(), q_delta.data_ptr<float>(),
++        head_to_kv.data_ptr<int64_t>(),
++        reinterpret_cast<__half*>(scores.data_ptr<at::Half>()),
++        batch, q_heads, kv_heads, k_sign.size(1), tokens);
++}
++torch::Tensor popkv_score_encoded_cuda(
++    torch::Tensor q_sign, torch::Tensor q_mag,
++    torch::Tensor q_low, torch::Tensor q_delta,
++    torch::Tensor k_sign, torch::Tensor k_mag,
++    torch::Tensor low_mean, torch::Tensor delta_mean,
++    torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size) {
++    CHECK_CUDA(q_sign); CHECK_CUDA(q_mag); CHECK_CUDA(q_low); CHECK_CUDA(q_delta);
++    CHECK_CUDA(k_sign); CHECK_CUDA(k_mag); CHECK_CUDA(low_mean); CHECK_CUDA(delta_mean);
++    CHECK_CUDA(head_to_kv);
++    CHECK_CONTIGUOUS(q_sign); CHECK_CONTIGUOUS(q_mag);
++    CHECK_CONTIGUOUS(q_low); CHECK_CONTIGUOUS(q_delta);
++    CHECK_CONTIGUOUS(k_sign); CHECK_CONTIGUOUS(k_mag);
++    CHECK_CONTIGUOUS(low_mean); CHECK_CONTIGUOUS(delta_mean);
++    CHECK_CONTIGUOUS(head_to_kv);
++    CHECK_INT32(q_sign); CHECK_INT32(q_mag); CHECK_INT32(k_sign); CHECK_INT32(k_mag);
++    TORCH_CHECK(q_low.scalar_type() == at::kFloat && q_delta.scalar_type() == at::kFloat,
++                "encoded Pop-KV query representatives must be float32");
++    TORCH_CHECK(low_mean.scalar_type() == at::kHalf && delta_mean.scalar_type() == at::kHalf,
++                "Pop-KV key representatives must be float16");
++    TORCH_CHECK(head_to_kv.scalar_type() == at::kLong, "head mapping must be int64");
++    TORCH_CHECK(dim_group_size == 16 || dim_group_size == 32 || dim_group_size == 64,
++                "dim_group_size must be 16, 32, or 64");
++    TORCH_CHECK(q_sign.dim() == 3 && q_sign.size(2) == 4 && q_mag.sizes() == q_sign.sizes(),
++                "encoded Pop-KV query bitplanes must be [batch, query heads, 4]");
++    int64_t batch = q_sign.size(0), q_heads = q_sign.size(1);
++    int64_t reps = 128 / dim_group_size, kv_heads = k_sign.size(0);
++    TORCH_CHECK(q_low.sizes() == q_delta.sizes() && q_low.dim() == 3 &&
++                q_low.size(0) == batch && q_low.size(1) == q_heads && q_low.size(2) == reps,
++                "encoded Pop-KV query representative shape mismatch");
++    TORCH_CHECK(k_sign.dim() == 3 && k_sign.size(2) == 4 && k_mag.sizes() == k_sign.sizes(),
++                "Pop-KV key bitplanes must be [KV heads, capacity, 4]");
++    TORCH_CHECK(low_mean.sizes() == delta_mean.sizes() && low_mean.dim() == 3 &&
++                low_mean.size(0) == kv_heads && low_mean.size(1) == k_sign.size(1) &&
++                low_mean.size(2) == reps, "Pop-KV key representative shape mismatch");
++    TORCH_CHECK(tokens > 0 && tokens <= k_sign.size(1), "invalid score token count");
++    TORCH_CHECK(head_to_kv.numel() == q_heads && q_heads % kv_heads == 0,
++                "invalid GQA head mapping");
++    TORCH_CHECK(q_sign.device() == k_sign.device() && q_mag.device() == k_sign.device() &&
++                q_low.device() == k_sign.device() && q_delta.device() == k_sign.device() &&
++                k_mag.device() == k_sign.device() && low_mean.device() == k_sign.device() &&
++                delta_mean.device() == k_sign.device() && head_to_kv.device() == k_sign.device(),
++                "encoded score tensors must share a CUDA device");
++    c10::cuda::CUDAGuard guard(k_sign.device());
++    auto scores = torch::empty({batch, q_heads, tokens},
++                               low_mean.options().dtype(torch::kFloat16));
++    if (dim_group_size == 16) {
++        launch_popkv_score_encoded_gqa_tiled<16>(
++            q_sign, q_mag, q_low, q_delta, k_sign, k_mag, low_mean, delta_mean,
++            head_to_kv, scores);
++    } else if (dim_group_size == 32) {
++        launch_popkv_score_encoded_gqa_tiled<32>(
++            q_sign, q_mag, q_low, q_delta, k_sign, k_mag, low_mean, delta_mean,
++            head_to_kv, scores);
++    } else {
++        launch_popkv_score_encoded_gqa_tiled<64>(
++            q_sign, q_mag, q_low, q_delta, k_sign, k_mag, low_mean, delta_mean,
++            head_to_kv, scores);
++    }
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return scores;
++}
+diff --git a/fier_triton.py b/fier_triton.py
+index 7afdd80..fa9e7cb 100644
+--- a/fier_triton.py
++++ b/fier_triton.py
+@@ -72,69 +72,14 @@ def _pack_kernel(
+         mask=token < tokens,
+         other=0.0,
+     ).to(tl.float32)
+-    bit = (value >= (lo + hi) * 0.5) & (token < tokens)
++    midpoint = (lo + hi) * 0.5
++    bit = (value > midpoint) & (token < tokens)
+     # Accumulate in int64 so lane 31 does not overflow during the reduction;
+     # storing to int32 preserves the desired bit pattern.
+     word_value = tl.sum(bit.to(tl.int64) << lane, axis=0)
+     tl.store(packed + (kvh * head_dim + d) * words + word, word_value)
+ 
+ 
+-@triton.jit
+-def _score_kernel(
+-    queries,
+-    packed,
+-    mins,
+-    maxs,
+-    head_to_kv,
+-    scores,
+-    tokens,
+-    q_heads: tl.constexpr,
+-    head_dim: tl.constexpr,
+-    num_groups,
+-    words,
+-    group_size: tl.constexpr,
+-    BLOCK_D: tl.constexpr,
+-    BLOCK_T: tl.constexpr,
+-):
+-    token_block = tl.program_id(0)
+-    row = tl.program_id(1)
+-    qh = row % q_heads
+-    kvh = tl.load(head_to_kv + qh)
+-    token = token_block * BLOCK_T + tl.arange(0, BLOCK_T)
+-    dims = tl.arange(0, BLOCK_D)
+-    token_mask = token < tokens
+-    dim_mask = dims < head_dim
+-
+-    query = tl.load(
+-        queries + row * head_dim + dims,
+-        mask=dim_mask,
+-        other=0.0,
+-    ).to(tl.float32)
+-    words_value = tl.load(
+-        packed + (kvh * head_dim + dims[None, :]) * words + token[:, None] // 32,
+-        mask=token_mask[:, None] & dim_mask[None, :],
+-        other=0,
+-    )
+-    bit = (words_value >> (token[:, None] % 32)) & 1
+-    group = token // group_size
+-    metadata_offset = (
+-        (kvh * num_groups + group[:, None]) * head_dim + dims[None, :]
+-    )
+-    lo = tl.load(
+-        mins + metadata_offset,
+-        mask=token_mask[:, None] & dim_mask[None, :],
+-        other=0.0,
+-    ).to(tl.float32)
+-    hi = tl.load(
+-        maxs + metadata_offset,
+-        mask=token_mask[:, None] & dim_mask[None, :],
+-        other=0.0,
+-    ).to(tl.float32)
+-    dequantized = tl.where(bit != 0, hi, lo)
+-    result = tl.sum(dequantized * query[None, :], axis=1)
+-    tl.store(scores + row * tokens + token, result, mask=token_mask)
+-
+-
+ def _validate_keys(keys: torch.Tensor, group_size: int) -> None:
+     if keys.ndim != 3:
+         raise ValueError("keys must be [KVH, T, D]")
+@@ -149,12 +94,16 @@ def _validate_keys(keys: torch.Tensor, group_size: int) -> None:
+ 
+ 
+ def pack_keys(
+-    keys: torch.Tensor, *, group_size: int
++    keys: torch.Tensor, *, group_size: int, implementation: str = "author"
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """Pack [KVH, T, D] keys and return (bits, group_min, group_max)."""
++    """Pack authors-style FIER keys as [KVH, token_word, D]."""
+ 
+     keys = keys.contiguous()
+     _validate_keys(keys, int(group_size))
++    if implementation != "author":
++        raise ValueError("only the FIER authors implementation is public")
++    if implementation == "author" and group_size != 32:
++        raise ValueError("authors-style FIER requires group_size=32")
+     kv_heads, tokens, head_dim = (int(v) for v in keys.shape)
+     num_groups = math.ceil(tokens / group_size)
+     words = math.ceil(tokens / 32)
+@@ -191,70 +140,49 @@ def pack_keys(
+             group_size=group_size,
+             num_warps=1,
+         )
++    packed = packed.transpose(1, 2).contiguous()
++    maxs.sub_(mins)  # Author notation: zero=min, scale=max-min.
+     return packed, mins, maxs
+ 
+ 
+ def score_packed_batched(
+     queries: torch.Tensor,
+     packed: torch.Tensor,
+-    mins: torch.Tensor,
+-    maxs: torch.Tensor,
++    zero: torch.Tensor,
++    scale: torch.Tensor,
+     head_to_kv: torch.Tensor,
+     *,
+     tokens: int,
+     group_size: int,
++    implementation: str = "author",
+ ) -> torch.Tensor:
+-    """Fused dequantization/GEMV for queries [B, QH, D]."""
+-
++    """Authors-style fused 1-bit dequantization/GEMV for [B,QH,D]."""
++    if implementation != "author":
++        raise ValueError("only the FIER authors implementation is public")
++    if group_size != 32:
++        raise ValueError("FIER-author requires group_size=32")
+     if queries.ndim != 3 or packed.ndim != 3:
+         raise ValueError("queries and packed keys must be rank 3")
+     if not queries.is_cuda or queries.device != packed.device:
+-        raise RuntimeError("all FIER Triton tensors must share a CUDA device")
+-    batch, q_heads, head_dim = (int(v) for v in queries.shape)
+-    if int(packed.shape[1]) != head_dim:
+-        raise ValueError("query/key head_dim mismatch")
+-    if mins.shape != maxs.shape or mins.ndim != 3:
+-        raise ValueError("group min/max tensors must have matching rank-3 shapes")
+-    if int(mins.shape[0]) != int(packed.shape[0]):
+-        raise ValueError("packed key and metadata KV-head counts differ")
+-    if tokens <= 0 or tokens > int(packed.shape[2]) * 32:
+-        raise ValueError("tokens is inconsistent with packed key storage")
++        raise RuntimeError("all FIER tensors must share a CUDA device")
++    _, q_heads, head_dim = (int(v) for v in queries.shape)
++    if int(packed.shape[2]) != head_dim:
++        raise ValueError("authors-style packed key must be [KVH, words, head_dim]")
++    if zero.shape != scale.shape or zero.ndim != 3:
++        raise ValueError("authors-style zero/scale tensors must have matching shapes")
+     expected_groups = math.ceil(tokens / group_size)
+-    if int(mins.shape[1]) < expected_groups or int(mins.shape[2]) != head_dim:
+-        raise ValueError("metadata capacity is inconsistent with tokens/group_size")
+-    storage_groups = int(mins.shape[1])
+-    storage_words = int(packed.shape[2])
+-    if head_to_kv.numel() != q_heads:
+-        raise ValueError("head_to_kv must contain one entry per query head")
+-
+-    queries = queries.contiguous()
+-    head_to_kv = head_to_kv.to(
+-        device=queries.device, dtype=torch.int64
+-    ).contiguous()
+-    scores = torch.empty(
+-        (batch, q_heads, tokens), device=queries.device, dtype=torch.float32
++    if tokens <= 0 or tokens > int(packed.shape[1]) * 32:
++        raise ValueError("tokens is inconsistent with authors-style packed storage")
++    if int(zero.shape[0]) != int(packed.shape[0]) or int(zero.shape[1]) < expected_groups:
++        raise ValueError("authors-style metadata capacity is inconsistent with tokens")
++    if int(zero.shape[2]) != head_dim or head_to_kv.numel() != q_heads:
++        raise ValueError("authors-style head dimensions or mapping are inconsistent")
++    from popkv_cuda import score_fier_author
++    return score_fier_author(
++        queries.contiguous(), packed, zero, scale,
++        head_to_kv=head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous(),
++        tokens=tokens,
+     )
+-    block_d = triton.next_power_of_2(head_dim)
+-    block_t = 32
+-    with torch.cuda.device(queries.device):
+-        _score_kernel[(triton.cdiv(tokens, block_t), batch * q_heads)](
+-            queries,
+-            packed,
+-            mins,
+-            maxs,
+-            head_to_kv,
+-            scores,
+-            tokens=tokens,
+-            q_heads=q_heads,
+-            head_dim=head_dim,
+-            num_groups=storage_groups,
+-            words=storage_words,
+-            group_size=group_size,
+-            BLOCK_D=block_d,
+-            BLOCK_T=block_t,
+-            num_warps=4,
+-        )
+-    return scores
+ 
+ 
+ def score_tensors(
+@@ -263,8 +191,9 @@ def score_tensors(
+     *,
+     head_to_kv: torch.Tensor,
+     group_size: int,
++    implementation: str = "author",
+ ) -> torch.Tensor:
+-    packed, mins, maxs = pack_keys(keys, group_size=group_size)
++    packed, mins, maxs = pack_keys(keys, group_size=group_size, implementation=implementation)
+     return score_packed_batched(
+         queries,
+         packed,
+@@ -273,4 +202,5 @@ def score_tensors(
+         head_to_kv,
+         tokens=int(keys.shape[1]),
+         group_size=group_size,
++        implementation=implementation,
+     )
+diff --git a/popkv.py b/popkv.py
+index 24ad96b..2b6e4f3 100644
+--- a/popkv.py
++++ b/popkv.py
+@@ -13,7 +13,13 @@ from typing import Any, Sequence
+ import torch
+ import torch.nn.functional as F
+ 
+-METHODS = ("full", "quest", "fier", "popkv")
++METHODS = ("full", "quest", "fier-author", "popkv-normal", "popkv-q", "popkv-s")
++
++POPKV_PRESETS = {
++    "popkv-normal": (32, 32),
++    "popkv-q": (128, 16),
++    "popkv-s": (64, 64),
++}
+ TOKEN_GROUP_SIZE = 32
+ SPECIALIZED_TOKEN_GROUP_SIZES = (8, 16, 32, 64, 128)
+ MAX_TOKEN_GROUP_SIZE = 4096
+@@ -30,6 +36,7 @@ class RetrievalConfig:
+     dim_group_size: int = 32  # dimensions sharing low/delta representatives (G_dim)
+     dim_kernel: str = "auto"  # specialized score kernel; auto follows G_dim
+     quest_page_size: int = 16
++    fier_kernel: str = "author"
+     full_layers: tuple[int, ...] = (0, 1)
+ 
+     def validate(self) -> None:
+@@ -51,6 +58,8 @@ class RetrievalConfig:
+                 )
+         if self.quest_page_size <= 0:
+             raise ValueError("quest_page_size must be positive")
++        if self.fier_kernel != "author":
++            raise ValueError("the public FIER method is fixed to the authors implementation")
+ 
+ 
+ @dataclass
+@@ -73,6 +82,7 @@ class FIERCache:
+     group_max: torch.Tensor
+     active_keys: torch.Tensor
+ 
++    implementation: str = "author"
+ 
+ @dataclass
+ class PopKVCache:
+@@ -106,9 +116,16 @@ class DecodeDiagnostics:
+     candidate_search_ms: float = 0.0
+     retrieval_stage_ms: float = 0.0
+     candidate_score_ms: float = 0.0
++    retrieval_query_encode_ms: float = 0.0
++    retrieval_score_ms: float = 0.0
++    retrieval_search_ms: float = 0.0
+     candidate_topk_ms: float = 0.0
+-    selected_gather_ms: float = 0.0
+-    selected_attention_ms: float = 0.0
++    selected_gather_ms: float = 0.0  # derived compatibility total
++    selected_attention_ms: float = 0.0  # derived compatibility total
++    full_gather_ms: float = 0.0
++    full_attention_ms: float = 0.0
++    sparse_attention_partial_ms: float = 0.0
++    sparse_attention_merge_ms: float = 0.0
+     frontend_ms: float = 0.0
+     qkv_rope_ms: float = 0.0
+     output_projection_ms: float = 0.0
+@@ -127,10 +144,13 @@ _DECODE_STAGE_FIELDS = {
+     "frontend": "frontend_ms",
+     "qkv_rope": "qkv_rope_ms",
+     "retrieval_stage": "retrieval_stage_ms",
+-    "score": "candidate_score_ms",
++    "retrieval_query_encode": "retrieval_query_encode_ms",
++    "retrieval_score": "retrieval_score_ms",
+     "topk": "candidate_topk_ms",
+-    "gather": "selected_gather_ms",
+-    "attention": "selected_attention_ms",
++    "full_gather": "full_gather_ms",
++    "full_attention": "full_attention_ms",
++    "sparse_attention_partial": "sparse_attention_partial_ms",
++    "sparse_attention_merge": "sparse_attention_merge_ms",
+     "output_projection": "output_projection_ms",
+     "mlp": "mlp_ms",
+     "final_norm_lm_head": "final_norm_lm_head_ms",
+@@ -165,8 +185,17 @@ class _DecodeStageTimer:
+         totals = {name: 0.0 for name in _DECODE_STAGE_FIELDS}
+         for name, start, end in self.segments: totals[name] += elapsed(start, end)
+         for name, field_name in _DECODE_STAGE_FIELDS.items(): setattr(diagnostics, field_name, totals[name])
+-        diagnostics.candidate_search_ms = (diagnostics.retrieval_stage_ms +
+-            diagnostics.candidate_score_ms + diagnostics.candidate_topk_ms)
++        diagnostics.selected_gather_ms = diagnostics.full_gather_ms
++        diagnostics.selected_attention_ms = (
++            diagnostics.full_attention_ms + diagnostics.sparse_attention_partial_ms
++            + diagnostics.sparse_attention_merge_ms
++        )
++        diagnostics.candidate_score_ms = diagnostics.retrieval_score_ms
++        diagnostics.retrieval_search_ms = (
++            diagnostics.retrieval_query_encode_ms + diagnostics.retrieval_score_ms
++            + diagnostics.candidate_topk_ms
++        )
++        diagnostics.candidate_search_ms = diagnostics.retrieval_search_ms
+         diagnostics.gpu_component_sum_ms = sum(totals.values())
+         diagnostics.gpu_decode_ms = elapsed(self.total_start, self.last)
+         diagnostics.gpu_unattributed_ms = diagnostics.gpu_decode_ms - diagnostics.gpu_component_sum_ms
+@@ -308,38 +337,57 @@ def append_quest(
+ 
+ # ---- FIER ------------------------------------------------------------------
+ 
+-def build_fier_cache(keys: torch.Tensor, *, group_size: int, reserve_tokens: int) -> FIERCache:
++def build_fier_cache(
++    keys: torch.Tensor, *, group_size: int, reserve_tokens: int,
++    implementation: str = "author",
++) -> FIERCache:
+     from fier_triton import pack_keys
+ 
+-    packed, mins, maxs = pack_keys(keys.contiguous(), group_size=group_size)
++    packed, mins, maxs = pack_keys(
++        keys.contiguous(), group_size=group_size, implementation=implementation,
++    )
+     kv_heads, tokens, dim = (int(x) for x in keys.shape)
+     capacity = math.ceil((tokens + reserve_tokens) / group_size) * group_size
++    words = math.ceil(capacity / 32)
++    packed_shape = (
++        (kv_heads, words, dim) if implementation == "author"
++        else (kv_heads, dim, words)
++    )
+     packed_storage = torch.empty(
+-        (kv_heads, dim, math.ceil(capacity / 32)), device=keys.device, dtype=packed.dtype,
++        packed_shape, device=keys.device, dtype=packed.dtype,
+     )
+     min_storage = torch.empty(
+         (kv_heads, math.ceil(capacity / group_size), dim), device=keys.device, dtype=mins.dtype,
+     )
+     max_storage = torch.empty_like(min_storage)
+-    packed_storage[:, :, : packed.shape[2]].copy_(packed)
++    if implementation == "author":
++        packed_storage[:, : packed.shape[1], :].copy_(packed)
++    else:
++        packed_storage[:, :, : packed.shape[2]].copy_(packed)
+     min_storage[:, : mins.shape[1]].copy_(mins)
+     max_storage[:, : maxs.shape[1]].copy_(maxs)
+     sealed = (tokens // group_size) * group_size
+     cache = FIERCache(
+         group_size, tokens, sealed, packed_storage, min_storage, max_storage,
+-        keys[:, sealed:].detach().clone().contiguous(),
++        keys[:, sealed:].detach().clone().contiguous(), implementation,
+     )
+     if int(cache.active_keys.shape[1]): write_fier_active(cache)
+     return cache
+ 
+ 
+ def write_fier_active(cache: FIERCache) -> None:
+-    from popkv_cuda import update_fier_metadata
+-
+-    update_fier_metadata(
+-        cache.active_keys, cache.packed, cache.group_min, cache.group_max,
+-        token_offset=cache.sealed_tokens,
+-    )
++    if cache.implementation == "author":
++        from popkv_cuda import update_fier_author_metadata
++        update_fier_author_metadata(
++            cache.active_keys, cache.packed, cache.group_min, cache.group_max,
++            token_offset=cache.sealed_tokens,
++        )
++    else:
++        from popkv_cuda import update_fier_metadata
++        update_fier_metadata(
++            cache.active_keys, cache.packed, cache.group_min, cache.group_max,
++            token_offset=cache.sealed_tokens,
++        )
+ 
+ 
+ def append_fier(
+@@ -729,19 +777,41 @@ class LlamaSparseDecoder:
+         return self.backbone.embed_tokens.weight.device
+ 
+     @torch.inference_mode()
+-    def build_prefix_cache(self, prefix_ids: torch.Tensor):
++    def build_prefix_cache(
++        self, prefix_ids: torch.Tensor, *, reserve_tokens: int = 0, chunk_size: int = 0,
++    ):
+         ids = prefix_ids.to(self.device).view(1, -1)
+-        return self.backbone(
+-            input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=True,
+-            output_hidden_states=False, return_dict=True,
+-        ).past_key_values
++        if chunk_size <= 0:
++            return self.backbone(
++                input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=True,
++                output_hidden_states=False, return_dict=True,
++            ).past_key_values
++
++        from transformers import StaticCache
++
++        length = int(ids.shape[1])
++        capacity = length + int(reserve_tokens)
++        past = StaticCache(config=self.model.config, max_cache_len=capacity)
++        for start in range(0, length, int(chunk_size)):
++            end = min(start + int(chunk_size), length)
++            cache_position = torch.arange(start, end, device=self.device, dtype=torch.long)
++            self.backbone(
++                input_ids=ids[:, start:end], past_key_values=past,
++                cache_position=cache_position, use_cache=True,
++                output_hidden_states=False, return_dict=True,
++            )
++        return StaticKVCache(
++            [layer.keys for layer in past.layers],
++            [layer.values for layer in past.layers],
++            length, capacity,
++        )
+ 
+     @torch.inference_mode()
+     def build_retrieval_caches(
+         self, prefix_cache: Any, *, method: str, reserve_tokens: int = 2048,
+     ) -> RetrievalCaches:
+-        if method not in {"quest", "fier", "popkv"}:
+-            raise ValueError("retrieval caches are only used by sparse methods")
++        if method not in set(METHODS) - {"full"}:
++            raise ValueError("retrieval caches are only used by public sparse methods")
+         layers: dict[int, QuestCache | FIERCache | PopKVCache] = {}
+         for layer in _sparse_layer_indices(len(self.layers), self.retrieval.full_layers):
+             keys, _ = _layer_cache(prefix_cache, layer)
+@@ -750,14 +820,19 @@ class LlamaSparseDecoder:
+                 layers[layer] = build_quest_cache(
+                     keys, page_size=self.retrieval.quest_page_size, reserve_tokens=reserve_tokens,
+                 )
+-            elif method == "fier":
++            elif method == "fier-author":
+                 layers[layer] = build_fier_cache(
+                     keys, group_size=TOKEN_GROUP_SIZE, reserve_tokens=reserve_tokens,
++                    implementation="author",
+                 )
+             else:
++                try:
++                    group_size, dim_group_size = POPKV_PRESETS[method]
++                except KeyError as exc:
++                    raise ValueError(f"unknown PopKV preset: {method}") from exc
+                 layers[layer] = build_popkv_cache(
+-                    keys, group_size=self.retrieval.group_size,
+-                    dim_group_size=self.retrieval.dim_group_size, reserve_tokens=reserve_tokens,
++                    keys, group_size=group_size, dim_group_size=dim_group_size,
++                    reserve_tokens=reserve_tokens,
+                 )
+         return RetrievalCaches(method, layers)
+ 
+@@ -824,6 +899,13 @@ class LlamaSparseDecoder:
+ 
+     @torch.inference_mode()
+     def build_static_kv_cache(self, prefix_cache: Any, *, reserve_tokens: int) -> StaticKVCache:
++        if isinstance(prefix_cache, StaticKVCache):
++            if prefix_cache.capacity < prefix_cache.length + reserve_tokens:
++                raise ValueError("existing static KV cache has insufficient reserve capacity")
++            return StaticKVCache(
++                prefix_cache.key_storage, prefix_cache.value_storage,
++                prefix_cache.length, prefix_cache.capacity,
++            )
+         first, _ = _layer_cache(prefix_cache, 0)
+         length, capacity = int(first.shape[-2]), int(first.shape[-2]) + reserve_tokens
+         keys_out, values_out = [], []
+@@ -895,13 +977,13 @@ class LlamaSparseDecoder:
+             force_full = method == "full" or layer_idx in self.retrieval.full_layers
+             if force_full:
+                 def gather_full(): return torch.cat([prefix_k, k], 2), torch.cat([prefix_v, v], 2)
+-                all_k, all_v = gather_full(); timer.mark("gather")
++                all_k, all_v = gather_full(); timer.mark("full_gather")
+                 def attend_full():
+                     grouped = q[0].view(self.num_kv_heads, self.kv_group_size, 1, self.head_dim)
+                     return F.scaled_dot_product_attention(
+                         grouped, all_k[0, :, None], all_v[0, :, None], dropout_p=0.0, is_causal=False,
+                     ).reshape(self.num_heads, self.head_dim)
+-                output = attend_full(); timer.mark("attention")
++                output = attend_full(); timer.mark("full_attention")
+             else:
+                 num_tokens = prefix_length + 1
+                 sparse_cache = retrieval_caches.layers[layer_idx]  # type: ignore[union-attr]
+@@ -914,13 +996,13 @@ class LlamaSparseDecoder:
+                         q[0, :, 0], sparse_cache.page_min, sparse_cache.page_max,
+                         self.head_to_kv, pages=pages,
+                     )
+-                    timer.mark("score")
++                    timer.mark("retrieval_score")
+                     indices, valid = quest_indices(
+                         scores, num_tokens=num_tokens, page_size=self.retrieval.quest_page_size,
+                         budget=self.retrieval.budget,
+                     )
+                     timer.mark("topk")
+-                elif method == "fier":
++                elif method == "fier-author":
+                     assert isinstance(sparse_cache, FIERCache)
+                     from fier_triton import score_packed_batched
+                     def score_fier():
+@@ -928,8 +1010,9 @@ class LlamaSparseDecoder:
+                             q[0, :, 0].unsqueeze(0), sparse_cache.packed,
+                             sparse_cache.group_min, sparse_cache.group_max,
+                             self.head_to_kv, tokens=prefix_length, group_size=sparse_cache.group_size,
++                            implementation="author",
+                         )
+-                    scores = score_fier(); timer.mark("score")
++                    scores = score_fier(); timer.mark("retrieval_score")
+                     def topk_fier():
+                         selected = torch.topk(
+                             scores, k=min(self.retrieval.budget - 1, prefix_length),
+@@ -939,14 +1022,17 @@ class LlamaSparseDecoder:
+                     indices = topk_fier(); timer.mark("topk")
+                 else:
+                     assert isinstance(sparse_cache, PopKVCache)
+-                    from popkv_cuda import score as score_popkv
+-                    scores = score_popkv(
+-                        q[0, :, 0].unsqueeze(0).contiguous(), sparse_cache.packed,
++                    from popkv_cuda import query_encode, score_encoded
++                    encoded_query = query_encode(
++                        q[0, :, 0].unsqueeze(0).contiguous(),
++                        dim_group_size=sparse_cache.dim_group_size,
++                    ); timer.mark("retrieval_query_encode")
++                    scores = score_encoded(
++                        encoded_query, sparse_cache.packed,
+                         head_to_kv=self.head_to_kv, tokens=sparse_cache.token_count,
+                         dim_group_size=sparse_cache.dim_group_size,
+-                        dim_kernel=self.retrieval.dim_kernel,
+-                    )
+-                    timer.mark("score")
++                        dim_kernel={16: "g16", 32: "g32", 64: "g64-u32"}[sparse_cache.dim_group_size],
++                    ); timer.mark("retrieval_score")
+                     def topk_popkv():
+                         selected = torch.topk(
+                             scores, k=min(self.retrieval.budget - 1, prefix_length),
+@@ -958,15 +1044,18 @@ class LlamaSparseDecoder:
+                 diag.selected_tokens += int(indices.numel())
+                 diag.available_tokens += num_tokens * self.num_heads
+                 diag.sparse_head_calls += self.num_heads
+-                # Indexed attention reads selected K/V directly from the cache;
+-                # no per-query-head gathered K/V tensor is materialized.
+-                timer.mark("gather")
+-                from sparse_kernels import indexed_attention
+-                output = indexed_attention(
++                # Token-tiled split attention reads indexed K/V directly. Partial
++                # online-softmax states and their merge are timed exclusively.
++                from sparse_kernels import (
++                    indexed_attention_split_merge, indexed_attention_split_partial,
++                )
++                attention_partials = indexed_attention_split_partial(
+                     q[0, :, 0], prefix_k[0], prefix_v[0], k[0, :, 0], v[0, :, 0],
+-                    indices, self.head_to_kv, valid,
++                    indices, self.head_to_kv, valid, split_tokens=256,
+                 )
+-                timer.mark("attention")
++                timer.mark("sparse_attention_partial")
++                output = indexed_attention_split_merge(attention_partials, q[0, :, 0])
++                timer.mark("sparse_attention_merge")
+ 
+             output = output.reshape(1, 1, -1).to(normalized.dtype)
+             hidden = residual + attention.o_proj(output)
+diff --git a/popkv_cuda.py b/popkv_cuda.py
+index ec15a3b..b2a9d19 100644
+--- a/popkv_cuda.py
++++ b/popkv_cuda.py
+@@ -100,6 +100,44 @@ def update_fier_metadata(active_keys: torch.Tensor, packed: torch.Tensor, group_
+     _extension().fier_update(active_keys, packed, group_min, group_max, int(token_offset))
+ 
+ 
++def update_fier_author_metadata(
++    active_keys: torch.Tensor,
++    packed: torch.Tensor,
++    group_zero: torch.Tensor,
++    group_scale: torch.Tensor,
++    *,
++    token_offset: int,
++) -> None:
++    """Update one active g32 word in the authors' word-major cache layout."""
++    if active_keys.ndim != 3 or not active_keys.is_cuda or not active_keys.is_contiguous():
++        raise ValueError("active_keys must be contiguous CUDA [KV heads, tokens, head dim]")
++    _extension().fier_author_update(
++        active_keys, packed, group_zero, group_scale, int(token_offset)
++    )
++
++
++def score_fier_author(
++    queries: torch.Tensor,
++    packed: torch.Tensor,
++    group_zero: torch.Tensor,
++    group_scale: torch.Tensor,
++    *,
++    head_to_kv: torch.Tensor,
++    tokens: int,
++) -> torch.Tensor:
++    """Authors-style fused 1-bit dequantization/GEMV with FP16 scores."""
++    if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
++        raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
++    return _extension().fier_author_score(
++        queries,
++        packed,
++        group_zero,
++        group_scale,
++        head_to_kv.contiguous(),
++        int(tokens),
++    )
++
++
+ def allocate_query_encode_outputs(queries: torch.Tensor, *, dim_group_size: int = 32):
+     """Allocate benchmark/debug outputs matching the fused scorer's query state."""
+     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
+@@ -117,7 +155,7 @@ def allocate_query_encode_outputs(queries: torch.Tensor, *, dim_group_size: int
+ 
+ 
+ def query_encode(queries: torch.Tensor, *, out=None, dim_group_size: int = 32):
+-    """Run the benchmark-only dimension-group query encoder; production is unchanged."""
++    """Encode a PopKV query into bitplanes and dimension-group representatives."""
+     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
+         raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
+     dim_group_size = _validate_dim_group_size(dim_group_size)
+@@ -129,11 +167,31 @@ def query_encode(queries: torch.Tensor, *, out=None, dim_group_size: int = 32):
+     return outputs
+ 
+ 
++def score_encoded(
++    encoded_query, packed, *, head_to_kv: torch.Tensor, tokens: int,
++    dim_group_size: int = 32, dim_kernel: str | None = None,
++) -> torch.Tensor:
++    """Score compressed keys from a pre-encoded head-dim-128 PopKV query."""
++    dim_group_size = _validate_dim_group_size(dim_group_size)
++    _validate_dim_kernel(dim_group_size, dim_kernel)
++    encoded_query = tuple(encoded_query)
++    packed = tuple(packed)
++    if len(encoded_query) != 4:
++        raise ValueError("encoded_query must contain q_sign, q_mag, q_low, q_delta")
++    if len(packed) != 4:
++        raise ValueError("packed must contain k_sign, k_mag, k_low, k_delta")
++    if any(not tensor.is_cuda or not tensor.is_contiguous() for tensor in encoded_query):
++        raise ValueError("encoded query tensors must be contiguous CUDA tensors")
++    return _extension().score_encoded(
++        *encoded_query, *packed, head_to_kv.contiguous(), int(tokens), dim_group_size,
++    )
++
++
+ def score(
+     queries: torch.Tensor, packed, *, head_to_kv: torch.Tensor, tokens: int,
+     dim_group_size: int = 32, dim_kernel: str | None = None,
+ ) -> torch.Tensor:
+-    """Return Pop-KV approximate QK scores for every query head and token."""
++    """Return approximate QK scores; the head-dim-128 fast path emits FP16."""
+     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
+         raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
+     dim_group_size = _validate_dim_group_size(dim_group_size)
+diff --git a/sparse_kernels.py b/sparse_kernels.py
+index f5b48a1..d3b7e6a 100644
+--- a/sparse_kernels.py
++++ b/sparse_kernels.py
+@@ -14,7 +14,6 @@ def _quest_score_kernel(
+     queries,
+     page_min,
+     page_max,
+-    head_to_kv,
+     scores,
+     pages,
+     q_heads: tl.constexpr,
+@@ -23,16 +22,21 @@ def _quest_score_kernel(
+     min_stride_p,
+     max_stride_h,
+     max_stride_p,
++    Q_PER_KV: tl.constexpr,
+     BLOCK_P: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+ ):
+     page_block = tl.program_id(0)
+-    qh = tl.program_id(1)
+-    kvh = tl.load(head_to_kv + qh)
++    kvh = tl.program_id(1)
++    q_local = tl.arange(0, Q_PER_KV)
++    qh = kvh * Q_PER_KV + q_local
+     page = page_block * BLOCK_P + tl.arange(0, BLOCK_P)
+     dim = tl.arange(0, BLOCK_D)
+     mask = (page[:, None] < pages) & (dim[None, :] < head_dim)
+-    query = tl.load(queries + qh * head_dim + dim, mask=dim < head_dim, other=0.0).to(tl.float32)
++    query = tl.load(
++        queries + qh[:, None] * head_dim + dim[None, :],
++        mask=(qh[:, None] < q_heads) & (dim[None, :] < head_dim), other=0.0,
++    ).to(tl.float32)
+     lo = tl.load(
+         page_min + kvh * min_stride_h + page[:, None] * min_stride_p + dim[None, :],
+         mask=mask,
+@@ -43,9 +47,19 @@ def _quest_score_kernel(
+         mask=mask,
+         other=0.0,
+     ).to(tl.float32)
+-    bound = tl.maximum(query[None, :] * lo, query[None, :] * hi)
+-    result = tl.sum(bound, axis=1)
+-    tl.store(scores + qh * pages + page, result, mask=page < pages)
++    # A CTA owns one KV head and reuses each min/max page tile for all GQA
++    # query heads mapped to it. Keeping Q_PER_KV * BLOCK_P approximately 16
++    # preserves the old arithmetic tile size while eliminating repeated
++    # metadata reads across GQA heads.
++    bound = tl.maximum(
++        query[:, None, :] * lo[None, :, :],
++        query[:, None, :] * hi[None, :, :],
++    )
++    result = tl.sum(bound, axis=2)
++    tl.store(
++        scores + qh[:, None] * pages + page[None, :], result,
++        mask=(qh[:, None] < q_heads) & (page[None, :] < pages),
++    )
+ 
+ 
+ def quest_scores(
+@@ -65,17 +79,25 @@ def quest_scores(
+     q_heads, head_dim = (int(x) for x in queries.shape)
+     if pages <= 0 or pages > int(page_min.shape[1]) or int(page_min.shape[2]) != head_dim:
+         raise ValueError("invalid Quest page count or head dimension")
+-    mapping = head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous()
++    kv_heads = int(page_min.shape[0])
++    if q_heads % kv_heads:
++        raise ValueError("Quest GQA fusion requires query heads divisible by KV heads")
++    q_per_kv = q_heads // kv_heads
++    if int(head_to_kv.numel()) != q_heads:
++        raise ValueError("Quest head mapping size mismatch")
+     scores = torch.empty((q_heads, pages), device=queries.device, dtype=torch.float32)
+     block_d = triton.next_power_of_2(head_dim)
+-    block_p = 16
++    # Match the previous 16-page-by-one-query arithmetic tile. For
++    # Llama-3.1-8B (four Q heads per KV head), this becomes four pages by four
++    # queries and loads every page-bound tile only once.
++    block_p = max(1, 16 // q_per_kv)
+     with torch.cuda.device(queries.device):
+-        _quest_score_kernel[(triton.cdiv(pages, block_p), q_heads)](
+-            queries.contiguous(), page_min, page_max, mapping, scores, pages,
++        _quest_score_kernel[(triton.cdiv(pages, block_p), kv_heads)](
++            queries.contiguous(), page_min, page_max, scores, pages,
+             q_heads=q_heads, head_dim=head_dim,
+             min_stride_h=page_min.stride(0), min_stride_p=page_min.stride(1),
+             max_stride_h=page_max.stride(0), max_stride_p=page_max.stride(1),
+-            BLOCK_P=block_p, BLOCK_D=block_d, num_warps=4,
++            Q_PER_KV=q_per_kv, BLOCK_P=block_p, BLOCK_D=block_d, num_warps=4,
+         )
+     return scores
+ 
+@@ -211,6 +233,174 @@ def indexed_attention(
+     return output
+ 
+ 
++
++@triton.jit
++def _indexed_attention_split_kernel(
++    queries, prefix_keys, prefix_values, current_keys, current_values,
++    indices, valid_mask, head_to_kv, partials, prefix_tokens,
++    selected_tokens, num_splits, stride_kh, stride_kt, stride_vh, stride_vt,
++    q_heads: tl.constexpr, head_dim: tl.constexpr, scale: tl.constexpr,
++    HAS_VALID: tl.constexpr, SPLIT_T: tl.constexpr, BLOCK_T: tl.constexpr,
++    BLOCK_D: tl.constexpr, STATE_D: tl.constexpr,
++):
++    qh = tl.program_id(0)
++    split = tl.program_id(1)
++    kvh = tl.load(head_to_kv + qh)
++    dim = tl.arange(0, BLOCK_D)
++    dim_mask = dim < head_dim
++    query = tl.load(queries + qh * head_dim + dim, mask=dim_mask, other=0.0).to(tl.float32)
++    current_key = tl.load(current_keys + kvh * head_dim + dim, mask=dim_mask, other=0.0).to(tl.float32)
++    current_value = tl.load(current_values + kvh * head_dim + dim, mask=dim_mask, other=0.0).to(tl.float32)
++    running_max = -float("inf")
++    running_sum = 0.0
++    accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
++    split_start = split * SPLIT_T
++
++    for local_start in range(0, SPLIT_T, BLOCK_T):
++        offset = split_start + local_start + tl.arange(0, BLOCK_T)
++        token_mask = offset < selected_tokens
++        token = tl.load(indices + qh * selected_tokens + offset, mask=token_mask, other=0)
++        if HAS_VALID:
++            token_mask = token_mask & tl.load(
++                valid_mask + qh * selected_tokens + offset, mask=token_mask, other=0
++            ).to(tl.int1)
++        is_current = token == prefix_tokens
++        safe_token = tl.minimum(token, prefix_tokens - 1)
++        tile_mask = token_mask[:, None] & dim_mask[None, :]
++        cached_key = tl.load(
++            prefix_keys + kvh * stride_kh + safe_token[:, None] * stride_kt + dim[None, :],
++            mask=tile_mask, other=0.0,
++        ).to(tl.float32)
++        key = tl.where(is_current[:, None], current_key[None, :], cached_key)
++        logits = tl.sum(key * query[None, :], axis=1) * scale
++        logits = tl.where(token_mask, logits, -float("inf"))
++        block_max = tl.max(logits, axis=0)
++        new_max = tl.maximum(running_max, block_max)
++        old_scale = tl.exp(running_max - new_max)
++        probabilities = tl.exp(logits - new_max)
++        probabilities = tl.where(token_mask, probabilities, 0.0)
++        cached_value = tl.load(
++            prefix_values + kvh * stride_vh + safe_token[:, None] * stride_vt + dim[None, :],
++            mask=tile_mask, other=0.0,
++        ).to(tl.float32)
++        value = tl.where(is_current[:, None], current_value[None, :], cached_value)
++        accumulator = accumulator * old_scale + tl.sum(probabilities[:, None] * value, axis=0)
++        running_sum = running_sum * old_scale + tl.sum(probabilities, axis=0)
++        running_max = new_max
++
++    state = (qh * num_splits + split) * STATE_D
++    tl.store(partials + state, running_max)
++    tl.store(partials + state + 1, running_sum)
++    tl.store(partials + state + 2 + dim, accumulator, mask=dim_mask)
++
++
++@triton.jit
++def _indexed_attention_merge_kernel(
++    partials, output, num_splits, head_dim: tl.constexpr,
++    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr, STATE_D: tl.constexpr,
++):
++    qh = tl.program_id(0)
++    split = tl.arange(0, BLOCK_S)
++    split_mask = split < num_splits
++    base = (qh * num_splits + split) * STATE_D
++    partial_max = tl.load(partials + base, mask=split_mask, other=-float("inf"))
++    partial_sum = tl.load(partials + base + 1, mask=split_mask, other=0.0)
++    global_max = tl.max(partial_max, axis=0)
++    weight = tl.exp(partial_max - global_max)
++    denominator = tl.sum(partial_sum * weight, axis=0)
++    dim = tl.arange(0, BLOCK_D)
++    dim_mask = dim < head_dim
++    accumulator = tl.load(
++        partials + base[:, None] + 2 + dim[None, :],
++        mask=split_mask[:, None] & dim_mask[None, :], other=0.0,
++    )
++    numerator = tl.sum(accumulator * weight[:, None], axis=0)
++    tl.store(output + qh * head_dim + dim, numerator / denominator, mask=dim_mask)
++
++
++def indexed_attention_split_partial(
++    queries: torch.Tensor, prefix_keys: torch.Tensor, prefix_values: torch.Tensor,
++    current_keys: torch.Tensor, current_values: torch.Tensor, indices: torch.Tensor,
++    head_to_kv: torch.Tensor, valid_mask: torch.Tensor | None = None, *,
++    split_tokens: int = 256,
++) -> torch.Tensor:
++    """Launch token-tiled online-softmax partial attention states."""
++    if queries.ndim != 2 or prefix_keys.ndim != 3 or prefix_values.shape != prefix_keys.shape:
++        raise ValueError("invalid indexed-attention tensor ranks or K/V shapes")
++    if indices.ndim != 2 or int(indices.shape[0]) != int(queries.shape[0]):
++        raise ValueError("indices must be [query heads, selected tokens]")
++    if valid_mask is not None and valid_mask.shape != indices.shape:
++        raise ValueError("valid mask must match indices")
++    if split_tokens <= 0 or split_tokens % 16:
++        raise ValueError("split_tokens must be a positive multiple of 16")
++    if not queries.is_cuda or any(x.device != queries.device for x in (
++        prefix_keys, prefix_values, current_keys, current_values, indices, head_to_kv
++    )):
++        raise RuntimeError("indexed-attention tensors must share a CUDA device")
++    q_heads, head_dim = (int(x) for x in queries.shape)
++    prefix_tokens = int(prefix_keys.shape[1])
++    selected_tokens = int(indices.shape[1])
++    if prefix_tokens <= 0 or selected_tokens <= 0:
++        raise ValueError("indexed attention requires non-empty prefix and selection")
++    num_splits = triton.cdiv(selected_tokens, split_tokens)
++    state_d = head_dim + 2
++    partials = torch.empty(
++        (q_heads, num_splits, state_d), device=queries.device, dtype=torch.float32,
++    )
++    dummy_valid = indices if valid_mask is None else valid_mask.contiguous()
++    mapping = head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous()
++    block_d = triton.next_power_of_2(head_dim)
++    with torch.cuda.device(queries.device):
++        _indexed_attention_split_kernel[(q_heads, num_splits)](
++            queries.contiguous(), prefix_keys, prefix_values,
++            current_keys.contiguous(), current_values.contiguous(), indices.contiguous(),
++            dummy_valid, mapping, partials, prefix_tokens, selected_tokens, num_splits,
++            stride_kh=prefix_keys.stride(0), stride_kt=prefix_keys.stride(1),
++            stride_vh=prefix_values.stride(0), stride_vt=prefix_values.stride(1),
++            q_heads=q_heads, head_dim=head_dim, scale=1.0 / math.sqrt(head_dim),
++            HAS_VALID=valid_mask is not None, SPLIT_T=split_tokens, BLOCK_T=16,
++            BLOCK_D=block_d, STATE_D=state_d, num_warps=4,
++        )
++    return partials
++
++
++def indexed_attention_split_merge(
++    partials: torch.Tensor, output_like: torch.Tensor,
++) -> torch.Tensor:
++    """Merge split online-softmax states into one output per query head."""
++    if partials.ndim != 3 or partials.dtype != torch.float32 or not partials.is_cuda:
++        raise ValueError("partials must be CUDA float32 [query heads, splits, D+2]")
++    if output_like.ndim != 2 or output_like.device != partials.device:
++        raise ValueError("output_like must be [query heads, head dim] on the partial device")
++    q_heads, num_splits, state_d = (int(x) for x in partials.shape)
++    head_dim = int(output_like.shape[1])
++    if int(output_like.shape[0]) != q_heads or state_d != head_dim + 2:
++        raise ValueError("partial/output shape mismatch")
++    output = torch.empty_like(output_like)
++    block_d = triton.next_power_of_2(head_dim)
++    with torch.cuda.device(output.device):
++        _indexed_attention_merge_kernel[(q_heads,)](
++            partials, output, num_splits, head_dim=head_dim,
++            BLOCK_S=triton.next_power_of_2(num_splits), BLOCK_D=block_d,
++            STATE_D=state_d, num_warps=4,
++        )
++    return output
++
++
++def indexed_attention_split(
++    queries: torch.Tensor, prefix_keys: torch.Tensor, prefix_values: torch.Tensor,
++    current_keys: torch.Tensor, current_values: torch.Tensor, indices: torch.Tensor,
++    head_to_kv: torch.Tensor, valid_mask: torch.Tensor | None = None, *,
++    split_tokens: int = 256,
++) -> torch.Tensor:
++    """Split-token fused indexed attention with online-softmax merging."""
++    partials = indexed_attention_split_partial(
++        queries, prefix_keys, prefix_values, current_keys, current_values,
++        indices, head_to_kv, valid_mask, split_tokens=split_tokens,
++    )
++    return indexed_attention_split_merge(partials, queries)
++
++
+ # ---- Quest exact page selection ---------------------------------------------
+ 
+ @triton.jit

@@ -1,0 +1,36 @@
+method,stage,ms_per_token
+Full,Static KV update,0.6492689124774188
+Full,Active-key staging,0.0
+Full,K metadata encoding,0.0
+Full,Metadata write,0.0
+Full,Group sealing,0.0
+Full,Retrieval GPU remainder,0.0
+Full,Update host remainder,0.04174740986636607
+QUEST,Static KV update,0.6503025501500815
+QUEST,Active-key staging,0.4023300374508835
+QUEST,K metadata encoding,0.18379594996804371
+QUEST,Metadata write,0.010135187504783972
+QUEST,Group sealing,0.022306262531128596
+QUEST,Retrieval GPU remainder,0.05027098761893285
+QUEST,Update host remainder,0.031232569531857733
+FIER-author,Static KV update,0.6603933130158112
+FIER-author,Active-key staging,0.4103874871856533
+FIER-author,K metadata encoding,0.18922352491645142
+FIER-author,Metadata write,0.010326312509641866
+FIER-author,Group sealing,0.0201964125088125
+FIER-author,Retrieval GPU remainder,0.0512086999744497
+FIER-author,Update host remainder,0.03152185804574401
+PopKV-Q,Static KV update,0.6423045998206363
+PopKV-Q,Active-key staging,0.4139557875925675
+PopKV-Q,K metadata encoding,0.5992859004007187
+PopKV-Q,Metadata write,0.0031950250309364494
+PopKV-Q,Group sealing,0.004366650034626218
+PopKV-Q,Retrieval GPU remainder,0.027731761386485233
+PopKV-Q,Update host remainder,0.02594407093420159
+PopKV-S,Static KV update,0.6495592499151825
+PopKV-S,Active-key staging,0.41656076262006536
+PopKV-S,K metadata encoding,0.38465913746040314
+PopKV-S,Metadata write,0.003881575032892215
+PopKV-S,Group sealing,0.00578766252974674
+PopKV-S,Retrieval GPU remainder,0.031195774567595435
+PopKV-S,Update host remainder,0.026858453691966135

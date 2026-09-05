@@ -13,7 +13,13 @@ from typing import Any, Sequence
 import torch
 import torch.nn.functional as F
 
-METHODS = ("full", "quest", "fier", "popkv")
+METHODS = ("full", "quest", "fier-author", "popkv-normal", "popkv-q", "popkv-s")
+
+POPKV_PRESETS = {
+    "popkv-normal": (32, 32),
+    "popkv-q": (128, 16),
+    "popkv-s": (64, 64),
+}
 TOKEN_GROUP_SIZE = 32
 SPECIALIZED_TOKEN_GROUP_SIZES = (8, 16, 32, 64, 128)
 MAX_TOKEN_GROUP_SIZE = 4096
@@ -30,6 +36,7 @@ class RetrievalConfig:
     dim_group_size: int = 32  # dimensions sharing low/delta representatives (G_dim)
     dim_kernel: str = "auto"  # specialized score kernel; auto follows G_dim
     quest_page_size: int = 16
+    fier_kernel: str = "author"
     full_layers: tuple[int, ...] = (0, 1)
 
     def validate(self) -> None:
@@ -51,6 +58,8 @@ class RetrievalConfig:
                 )
         if self.quest_page_size <= 0:
             raise ValueError("quest_page_size must be positive")
+        if self.fier_kernel != "author":
+            raise ValueError("the public FIER method is fixed to the authors implementation")
 
 
 @dataclass
@@ -73,6 +82,7 @@ class FIERCache:
     group_max: torch.Tensor
     active_keys: torch.Tensor
 
+    implementation: str = "author"
 
 @dataclass
 class PopKVCache:
@@ -106,9 +116,16 @@ class DecodeDiagnostics:
     candidate_search_ms: float = 0.0
     retrieval_stage_ms: float = 0.0
     candidate_score_ms: float = 0.0
+    retrieval_query_encode_ms: float = 0.0
+    retrieval_score_ms: float = 0.0
+    retrieval_search_ms: float = 0.0
     candidate_topk_ms: float = 0.0
-    selected_gather_ms: float = 0.0
-    selected_attention_ms: float = 0.0
+    selected_gather_ms: float = 0.0  # derived compatibility total
+    selected_attention_ms: float = 0.0  # derived compatibility total
+    full_gather_ms: float = 0.0
+    full_attention_ms: float = 0.0
+    sparse_attention_partial_ms: float = 0.0
+    sparse_attention_merge_ms: float = 0.0
     frontend_ms: float = 0.0
     qkv_rope_ms: float = 0.0
     output_projection_ms: float = 0.0
@@ -127,10 +144,13 @@ _DECODE_STAGE_FIELDS = {
     "frontend": "frontend_ms",
     "qkv_rope": "qkv_rope_ms",
     "retrieval_stage": "retrieval_stage_ms",
-    "score": "candidate_score_ms",
+    "retrieval_query_encode": "retrieval_query_encode_ms",
+    "retrieval_score": "retrieval_score_ms",
     "topk": "candidate_topk_ms",
-    "gather": "selected_gather_ms",
-    "attention": "selected_attention_ms",
+    "full_gather": "full_gather_ms",
+    "full_attention": "full_attention_ms",
+    "sparse_attention_partial": "sparse_attention_partial_ms",
+    "sparse_attention_merge": "sparse_attention_merge_ms",
     "output_projection": "output_projection_ms",
     "mlp": "mlp_ms",
     "final_norm_lm_head": "final_norm_lm_head_ms",
@@ -165,8 +185,17 @@ class _DecodeStageTimer:
         totals = {name: 0.0 for name in _DECODE_STAGE_FIELDS}
         for name, start, end in self.segments: totals[name] += elapsed(start, end)
         for name, field_name in _DECODE_STAGE_FIELDS.items(): setattr(diagnostics, field_name, totals[name])
-        diagnostics.candidate_search_ms = (diagnostics.retrieval_stage_ms +
-            diagnostics.candidate_score_ms + diagnostics.candidate_topk_ms)
+        diagnostics.selected_gather_ms = diagnostics.full_gather_ms
+        diagnostics.selected_attention_ms = (
+            diagnostics.full_attention_ms + diagnostics.sparse_attention_partial_ms
+            + diagnostics.sparse_attention_merge_ms
+        )
+        diagnostics.candidate_score_ms = diagnostics.retrieval_score_ms
+        diagnostics.retrieval_search_ms = (
+            diagnostics.retrieval_query_encode_ms + diagnostics.retrieval_score_ms
+            + diagnostics.candidate_topk_ms
+        )
+        diagnostics.candidate_search_ms = diagnostics.retrieval_search_ms
         diagnostics.gpu_component_sum_ms = sum(totals.values())
         diagnostics.gpu_decode_ms = elapsed(self.total_start, self.last)
         diagnostics.gpu_unattributed_ms = diagnostics.gpu_decode_ms - diagnostics.gpu_component_sum_ms
@@ -308,38 +337,57 @@ def append_quest(
 
 # ---- FIER ------------------------------------------------------------------
 
-def build_fier_cache(keys: torch.Tensor, *, group_size: int, reserve_tokens: int) -> FIERCache:
+def build_fier_cache(
+    keys: torch.Tensor, *, group_size: int, reserve_tokens: int,
+    implementation: str = "author",
+) -> FIERCache:
     from fier_triton import pack_keys
 
-    packed, mins, maxs = pack_keys(keys.contiguous(), group_size=group_size)
+    packed, mins, maxs = pack_keys(
+        keys.contiguous(), group_size=group_size, implementation=implementation,
+    )
     kv_heads, tokens, dim = (int(x) for x in keys.shape)
     capacity = math.ceil((tokens + reserve_tokens) / group_size) * group_size
+    words = math.ceil(capacity / 32)
+    packed_shape = (
+        (kv_heads, words, dim) if implementation == "author"
+        else (kv_heads, dim, words)
+    )
     packed_storage = torch.empty(
-        (kv_heads, dim, math.ceil(capacity / 32)), device=keys.device, dtype=packed.dtype,
+        packed_shape, device=keys.device, dtype=packed.dtype,
     )
     min_storage = torch.empty(
         (kv_heads, math.ceil(capacity / group_size), dim), device=keys.device, dtype=mins.dtype,
     )
     max_storage = torch.empty_like(min_storage)
-    packed_storage[:, :, : packed.shape[2]].copy_(packed)
+    if implementation == "author":
+        packed_storage[:, : packed.shape[1], :].copy_(packed)
+    else:
+        packed_storage[:, :, : packed.shape[2]].copy_(packed)
     min_storage[:, : mins.shape[1]].copy_(mins)
     max_storage[:, : maxs.shape[1]].copy_(maxs)
     sealed = (tokens // group_size) * group_size
     cache = FIERCache(
         group_size, tokens, sealed, packed_storage, min_storage, max_storage,
-        keys[:, sealed:].detach().clone().contiguous(),
+        keys[:, sealed:].detach().clone().contiguous(), implementation,
     )
     if int(cache.active_keys.shape[1]): write_fier_active(cache)
     return cache
 
 
 def write_fier_active(cache: FIERCache) -> None:
-    from popkv_cuda import update_fier_metadata
-
-    update_fier_metadata(
-        cache.active_keys, cache.packed, cache.group_min, cache.group_max,
-        token_offset=cache.sealed_tokens,
-    )
+    if cache.implementation == "author":
+        from popkv_cuda import update_fier_author_metadata
+        update_fier_author_metadata(
+            cache.active_keys, cache.packed, cache.group_min, cache.group_max,
+            token_offset=cache.sealed_tokens,
+        )
+    else:
+        from popkv_cuda import update_fier_metadata
+        update_fier_metadata(
+            cache.active_keys, cache.packed, cache.group_min, cache.group_max,
+            token_offset=cache.sealed_tokens,
+        )
 
 
 def append_fier(
@@ -729,19 +777,41 @@ class LlamaSparseDecoder:
         return self.backbone.embed_tokens.weight.device
 
     @torch.inference_mode()
-    def build_prefix_cache(self, prefix_ids: torch.Tensor):
+    def build_prefix_cache(
+        self, prefix_ids: torch.Tensor, *, reserve_tokens: int = 0, chunk_size: int = 0,
+    ):
         ids = prefix_ids.to(self.device).view(1, -1)
-        return self.backbone(
-            input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=True,
-            output_hidden_states=False, return_dict=True,
-        ).past_key_values
+        if chunk_size <= 0:
+            return self.backbone(
+                input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=True,
+                output_hidden_states=False, return_dict=True,
+            ).past_key_values
+
+        from transformers import StaticCache
+
+        length = int(ids.shape[1])
+        capacity = length + int(reserve_tokens)
+        past = StaticCache(config=self.model.config, max_cache_len=capacity)
+        for start in range(0, length, int(chunk_size)):
+            end = min(start + int(chunk_size), length)
+            cache_position = torch.arange(start, end, device=self.device, dtype=torch.long)
+            self.backbone(
+                input_ids=ids[:, start:end], past_key_values=past,
+                cache_position=cache_position, use_cache=True,
+                output_hidden_states=False, return_dict=True,
+            )
+        return StaticKVCache(
+            [layer.keys for layer in past.layers],
+            [layer.values for layer in past.layers],
+            length, capacity,
+        )
 
     @torch.inference_mode()
     def build_retrieval_caches(
         self, prefix_cache: Any, *, method: str, reserve_tokens: int = 2048,
     ) -> RetrievalCaches:
-        if method not in {"quest", "fier", "popkv"}:
-            raise ValueError("retrieval caches are only used by sparse methods")
+        if method not in set(METHODS) - {"full"}:
+            raise ValueError("retrieval caches are only used by public sparse methods")
         layers: dict[int, QuestCache | FIERCache | PopKVCache] = {}
         for layer in _sparse_layer_indices(len(self.layers), self.retrieval.full_layers):
             keys, _ = _layer_cache(prefix_cache, layer)
@@ -750,14 +820,19 @@ class LlamaSparseDecoder:
                 layers[layer] = build_quest_cache(
                     keys, page_size=self.retrieval.quest_page_size, reserve_tokens=reserve_tokens,
                 )
-            elif method == "fier":
+            elif method == "fier-author":
                 layers[layer] = build_fier_cache(
                     keys, group_size=TOKEN_GROUP_SIZE, reserve_tokens=reserve_tokens,
+                    implementation="author",
                 )
             else:
+                try:
+                    group_size, dim_group_size = POPKV_PRESETS[method]
+                except KeyError as exc:
+                    raise ValueError(f"unknown PopKV preset: {method}") from exc
                 layers[layer] = build_popkv_cache(
-                    keys, group_size=self.retrieval.group_size,
-                    dim_group_size=self.retrieval.dim_group_size, reserve_tokens=reserve_tokens,
+                    keys, group_size=group_size, dim_group_size=dim_group_size,
+                    reserve_tokens=reserve_tokens,
                 )
         return RetrievalCaches(method, layers)
 
@@ -824,6 +899,13 @@ class LlamaSparseDecoder:
 
     @torch.inference_mode()
     def build_static_kv_cache(self, prefix_cache: Any, *, reserve_tokens: int) -> StaticKVCache:
+        if isinstance(prefix_cache, StaticKVCache):
+            if prefix_cache.capacity < prefix_cache.length + reserve_tokens:
+                raise ValueError("existing static KV cache has insufficient reserve capacity")
+            return StaticKVCache(
+                prefix_cache.key_storage, prefix_cache.value_storage,
+                prefix_cache.length, prefix_cache.capacity,
+            )
         first, _ = _layer_cache(prefix_cache, 0)
         length, capacity = int(first.shape[-2]), int(first.shape[-2]) + reserve_tokens
         keys_out, values_out = [], []
@@ -895,13 +977,13 @@ class LlamaSparseDecoder:
             force_full = method == "full" or layer_idx in self.retrieval.full_layers
             if force_full:
                 def gather_full(): return torch.cat([prefix_k, k], 2), torch.cat([prefix_v, v], 2)
-                all_k, all_v = gather_full(); timer.mark("gather")
+                all_k, all_v = gather_full(); timer.mark("full_gather")
                 def attend_full():
                     grouped = q[0].view(self.num_kv_heads, self.kv_group_size, 1, self.head_dim)
                     return F.scaled_dot_product_attention(
                         grouped, all_k[0, :, None], all_v[0, :, None], dropout_p=0.0, is_causal=False,
                     ).reshape(self.num_heads, self.head_dim)
-                output = attend_full(); timer.mark("attention")
+                output = attend_full(); timer.mark("full_attention")
             else:
                 num_tokens = prefix_length + 1
                 sparse_cache = retrieval_caches.layers[layer_idx]  # type: ignore[union-attr]
@@ -914,13 +996,13 @@ class LlamaSparseDecoder:
                         q[0, :, 0], sparse_cache.page_min, sparse_cache.page_max,
                         self.head_to_kv, pages=pages,
                     )
-                    timer.mark("score")
+                    timer.mark("retrieval_score")
                     indices, valid = quest_indices(
                         scores, num_tokens=num_tokens, page_size=self.retrieval.quest_page_size,
                         budget=self.retrieval.budget,
                     )
                     timer.mark("topk")
-                elif method == "fier":
+                elif method == "fier-author":
                     assert isinstance(sparse_cache, FIERCache)
                     from fier_triton import score_packed_batched
                     def score_fier():
@@ -928,8 +1010,9 @@ class LlamaSparseDecoder:
                             q[0, :, 0].unsqueeze(0), sparse_cache.packed,
                             sparse_cache.group_min, sparse_cache.group_max,
                             self.head_to_kv, tokens=prefix_length, group_size=sparse_cache.group_size,
+                            implementation="author",
                         )
-                    scores = score_fier(); timer.mark("score")
+                    scores = score_fier(); timer.mark("retrieval_score")
                     def topk_fier():
                         selected = torch.topk(
                             scores, k=min(self.retrieval.budget - 1, prefix_length),
@@ -939,14 +1022,17 @@ class LlamaSparseDecoder:
                     indices = topk_fier(); timer.mark("topk")
                 else:
                     assert isinstance(sparse_cache, PopKVCache)
-                    from popkv_cuda import score as score_popkv
-                    scores = score_popkv(
-                        q[0, :, 0].unsqueeze(0).contiguous(), sparse_cache.packed,
+                    from popkv_cuda import query_encode, score_encoded
+                    encoded_query = query_encode(
+                        q[0, :, 0].unsqueeze(0).contiguous(),
+                        dim_group_size=sparse_cache.dim_group_size,
+                    ); timer.mark("retrieval_query_encode")
+                    scores = score_encoded(
+                        encoded_query, sparse_cache.packed,
                         head_to_kv=self.head_to_kv, tokens=sparse_cache.token_count,
                         dim_group_size=sparse_cache.dim_group_size,
-                        dim_kernel=self.retrieval.dim_kernel,
-                    )
-                    timer.mark("score")
+                        dim_kernel={16: "g16", 32: "g32", 64: "g64-u32"}[sparse_cache.dim_group_size],
+                    ); timer.mark("retrieval_score")
                     def topk_popkv():
                         selected = torch.topk(
                             scores, k=min(self.retrieval.budget - 1, prefix_length),
@@ -958,15 +1044,18 @@ class LlamaSparseDecoder:
                 diag.selected_tokens += int(indices.numel())
                 diag.available_tokens += num_tokens * self.num_heads
                 diag.sparse_head_calls += self.num_heads
-                # Indexed attention reads selected K/V directly from the cache;
-                # no per-query-head gathered K/V tensor is materialized.
-                timer.mark("gather")
-                from sparse_kernels import indexed_attention
-                output = indexed_attention(
-                    q[0, :, 0], prefix_k[0], prefix_v[0], k[0, :, 0], v[0, :, 0],
-                    indices, self.head_to_kv, valid,
+                # Token-tiled split attention reads indexed K/V directly. Partial
+                # online-softmax states and their merge are timed exclusively.
+                from sparse_kernels import (
+                    indexed_attention_split_merge, indexed_attention_split_partial,
                 )
-                timer.mark("attention")
+                attention_partials = indexed_attention_split_partial(
+                    q[0, :, 0], prefix_k[0], prefix_v[0], k[0, :, 0], v[0, :, 0],
+                    indices, self.head_to_kv, valid, split_tokens=256,
+                )
+                timer.mark("sparse_attention_partial")
+                output = indexed_attention_split_merge(attention_partials, q[0, :, 0])
+                timer.mark("sparse_attention_merge")
 
             output = output.reshape(1, 1, -1).to(normalized.dtype)
             hidden = residual + attention.o_proj(output)

@@ -2,6 +2,10 @@
 
 void quest_update_cuda(torch::Tensor keys, torch::Tensor page_min, torch::Tensor page_max, int64_t page);
 void fier_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_min, torch::Tensor group_max, int64_t token_offset);
+void fier_author_update_cuda(torch::Tensor keys, torch::Tensor packed, torch::Tensor group_zero, torch::Tensor group_scale, int64_t token_offset);
+torch::Tensor fier_author_score_cuda(
+    torch::Tensor queries, torch::Tensor packed, torch::Tensor group_zero,
+    torch::Tensor group_scale, torch::Tensor head_to_kv, int64_t tokens);
 std::vector<torch::Tensor> popkv_pack_cuda(
     torch::Tensor keys, int64_t token_capacity, int64_t token_group_size);
 void popkv_pack_into_cuda(
@@ -27,10 +31,16 @@ torch::Tensor popkv_score_dim_cuda(
     torch::Tensor low_mean, torch::Tensor delta_mean,
     torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size,
     bool use_uint64_popcount);
+torch::Tensor popkv_score_encoded_cuda(
+    torch::Tensor q_sign, torch::Tensor q_mag, torch::Tensor q_low, torch::Tensor q_delta,
+    torch::Tensor k_sign, torch::Tensor k_mag, torch::Tensor low_mean, torch::Tensor delta_mean,
+    torch::Tensor head_to_kv, int64_t tokens, int64_t dim_group_size);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quest_update", &quest_update_cuda);
     m.def("fier_update", &fier_update_cuda);
+    m.def("fier_author_update", &fier_author_update_cuda);
+    m.def("fier_author_score", &fier_author_score_cuda);
     m.def("pack", &popkv_pack_cuda);
     m.def("pack_into", &popkv_pack_into_cuda);
     m.def("score", &popkv_score_cuda);
@@ -38,4 +48,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pack_dim", &popkv_pack_dim_cuda);
     m.def("pack_into_dim", &popkv_pack_into_dim_cuda);
     m.def("score_dim", &popkv_score_dim_cuda);
+    m.def("score_encoded", &popkv_score_encoded_cuda);
 }

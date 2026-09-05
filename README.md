@@ -1,296 +1,203 @@
 # PopKV
 
-Official implementation of **PopKV**, a training-free KV-cache retrieval method for efficient long-context autoregressive decoding.
+Official implementation of **PopKV**, a training-free KV-cache retrieval method for long-context autoregressive decoding.
 
-**Paper:** [PopKV](https://openreview.net/forum?id=7kA636r4L1)
+[Paper](https://openreview.net/forum?id=7kA636r4L1) · [Minseok Choi](https://openreview.net/profile?id=~Minseok_Choi6) · [Geonhee Jang](https://openreview.net/profile?id=~Geonhee_Jang1)
 
-**Authors:** [Minseok Choi](https://openreview.net/profile?id=~Minseok_Choi6), [Geonhee Jang](https://openreview.net/profile?id=~Geonhee_Jang1)
+PopKV encodes query/key retrieval metadata as sign and magnitude bit planes, ranks cached tokens with CUDA popcount kernels, and computes attention over the selected full-precision K/V entries. It reduces retrieval and attention work while retaining the original K/V cache.
 
-PopKV compresses query/key retrieval metadata into sign and magnitude bit planes, retains two representative magnitudes per dimension group, and ranks cached tokens with fused CUDA popcount kernels. Final attention uses the selected full-precision K/V entries.
+## Methods
 
-The repository provides four comparable decoding methods:
+| Method | Retrieval | Token group | Dimension group |
+|---|---|---:|---:|
+| Full | Dense attention | — | — |
+| QUEST | Page min/max bounds; page size 16 | — | — |
+| FIER-author | Sequence-grouped one-bit retrieval | 32 | — |
+| PopKV-Q | Popcount retrieval; quality preset | 128 | 16 |
+| PopKV-S | Popcount retrieval; speed preset | 64 | 64 |
 
-- `full`: dense full attention.
-- `quest`: page-level min/max upper-bound retrieval with fused Triton scoring and page selection.
-- `fier`: FIER-style sequence-grouped one-bit retrieval with fused Triton scoring.
-- `popkv`: representative-weighted bit-popcount retrieval with specialized CUDA kernels.
+All published comparisons use these five methods. `popkv-normal` (token group 32, dimension group 32) remains available for ablations. Sparse methods keep layers 0 and 1 dense. Each query head selects its own tokens, including for GQA; the current token reserves one budget slot. Sparse attention uses 256-token partial reductions followed by a merge.
 
-
-## Highlights
-
-- Training-free and compatible with full-precision K/V caches.
-- Per-query-head token retrieval for Llama-style MHA, GQA, and MQA mappings.
-- Specialized PopKV kernels for token groups 8, 16, 32, 64, and 128 and dimension groups 16, 32, and 64.
-- Fused QUEST scoring and selection kernels.
-- Reproducible PG19 latency/PPL and LongBench quality experiments.
-
-## Method
-
-For channel `i` in dimension group `g`, PopKV reconstructs a query or key approximation as
+For channel `i` in dimension group `g`, the approximation is:
 
 ```text
 x_hat[i] = sign[i] * (low[g] + magnitude[i] * delta[g])
 ```
 
-`sign` and `magnitude` are binary indicators. `low` is the mean absolute value of low-magnitude channels and `delta = high - low`. The approximate dot product is evaluated without reconstructing dense vectors:
-
-```text
-score = sum_g (q_low*k_low*Csign
-             + q_delta*k_low*Cq
-             + q_low*k_delta*Ck
-             + q_delta*k_delta*Cqk) / sqrt(head_dim)
-```
-
-The signed agreement counts `Csign`, `Cq`, `Ck`, and `Cqk` are computed with 32-bit popcount operations. Retrieval is independent for every query head, and the newest token always reserves one budget position.
-
-## Repository layout
-
-```text
-popkv.py                         Core caches, retrieval methods, decoder, and references
-popkv_cuda.py                    JIT loader and Python interface for PopKV CUDA kernels
-sparse_kernels.py                Sparse attention CUDA/Triton kernels
-fier_triton.py                   FIER metadata packing and scoring kernels
-csrc/popkv_ext.{cpp,cu}          PopKV packing, update, query encoding, and score kernels
-experiments/evaluate_pg19.py     PG19 PPL and detailed latency evaluation
-experiments/evaluate_longbench.py LongBench quality evaluation
-experiments/sweep_token_groups.py Token-group sweep
-experiments/benchmarks/          CUDA microbenchmarks
-experiments/plots/               Ablation plotting utilities
-tests/                           CPU/CUDA correctness tests
-results/                         Compact machine-readable paper results
-```
+`low` and `delta = high - low` are representative magnitudes. The approximate dot product combines four signed agreement counts computed with 32-bit popcount, without reconstructing dense Q/K vectors. Final attention uses original-precision K/V values.
 
 ## Installation
 
-The kernels require Linux, an NVIDIA GPU, a CUDA toolkit with `nvcc`, and a CUDA-enabled PyTorch installation.
+Use Linux, an NVIDIA GPU, a CUDA toolkit with `nvcc`, and a CUDA-enabled PyTorch installation. Install PyTorch for your CUDA environment before the remaining dependencies:
 
 ```bash
-cd PopKV
 python -m venv .venv
 source .venv/bin/activate
-
-# Install the CUDA-enabled PyTorch build appropriate for your system first.
 pip install torch
 pip install -r requirements.txt
 ```
 
-The CUDA extension is compiled just in time on the first PopKV call. Build artifacts are stored in PyTorch's extension cache, not in this repository.
+The CUDA extension compiles on first use through PyTorch's extension loader. Authenticate for gated checkpoints with `hf auth login` or set `HF_TOKEN` (see [.env.example](.env.example)). Dataset caches, logs, local experiment outputs, and credentials are excluded from Git.
 
-### Hugging Face authentication
+The recorded LongBench environment used an RTX A6000 (48 GB), Python 3.11.10, PyTorch 2.4.1+cu124, and Transformers 4.57.6. See [environment](results/longbench_950_b4096/environment.txt) and [package versions](results/longbench_950_b4096/pip_freeze.txt). The historical PG19 metadata does not contain an equivalent hardware/software snapshot; do not treat the LongBench snapshot as a verified PG19 environment.
 
-The Llama checkpoints used by the experiments are gated. Request access and authenticate with either:
+## PG19: 32K quality and token-generation latency
 
-```bash
-hf auth login
-```
+**Model:** `meta-llama/Llama-3.1-8B` · **Context:** 32,768 · **Budget:** 4,096 · **Evaluation:** 10 blocks × 256 tokens per method · **Precision:** BF16 · **Seed:** 42.
 
-or:
+PG19 PPL is sampled next-token PPL from fixed blocks. Latency is the measured decode cycle after prefix prefill; token-generation time includes decode, next-token selection, and cache updates.
 
-```bash
-export HF_TOKEN=hf_your_read_token
-```
-
-Tokens, model caches, datasets, generated outputs, and logs are excluded by `.gitignore`.
-
-## Validation
-
-Run the complete correctness suite:
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Validate experiment configurations without loading a model:
-
-```bash
-python -m experiments.evaluate_pg19 --dry-run
-python -m experiments.evaluate_longbench --dry-run
-python -m experiments.sweep_token_groups --dry-run
-```
-
-## PG19 32K experiment
-
-The current comparison uses:
-
-- Model: `meta-llama/Llama-3.1-8B`
-- Context length: 32,768
-- Retrieval budget: 4,096
-- Generated/evaluated tokens: 128 per block
-- Blocks: 10 non-overlapping PG19 blocks
-- Total evaluated tokens: 1,280 per method
-- Seed: 42
-- Sparse layers: all except layers 0 and 1
-- GPU: NVIDIA RTX A6000 48 GB
-- PyTorch 2.4.1+cu124, CUDA toolkit 12.4, Triton 3.0.0
-
-The two PopKV operating points are:
-
-- **PopKV-Q**: quality-first, `tok-G=128`, `dim-G=16`, `g16` score kernel.
-- **PopKV-S**: speed-first, `tok-G=64`, `dim-G=64`, `g64-u32` score kernel.
-
-### End-to-end results
-
-Prepack is the one-time mean cost per block. All other latency columns are milliseconds per generated token.
-
-| Method | PPL ↓ | Prepack | Decode | Update | Token select | Token cycle | Generation step ↓ | TPS ↑ |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Full | **9.532** | **0.290** | 191.838 | **0.669** | 0.074 | 192.507 | 192.581 | 5.193 |
-| QUEST | 11.227 | 61.962 | **60.290** | 1.280 | **0.061** | **61.570** | **61.631** | **16.226** |
-| FIER | 9.618 | 70.092 | 68.402 | 1.285 | 0.062 | 69.687 | 69.749 | 14.337 |
-| PopKV-Q | **9.618** | 52.871 | 63.466 | 1.705 | 0.065 | 65.171 | 65.235 | 15.329 |
-| PopKV-S | 9.780 | **40.385** | 62.233 | 1.430 | 0.063 | 63.663 | 63.726 | 15.692 |
-
-`token cycle = decode + update`; `generation step = token cycle + token selection`.
-
-### Decode-stage latency
-
-| Method | Frontend | QKV+RoPE | Score | Top-k | Gather | Attention | Output proj. | MLP | Final norm/head |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Full | 0.408 | 5.073 | 0 | 0 | 20.290 | 140.938 | 2.139 | 20.711 | 1.798 |
-| QUEST | **0.365** | 4.890 | **1.099** | **0.856** | 1.292 | 26.837 | 2.115 | 20.519 | 1.796 |
-| FIER | 0.368 | 4.915 | 8.704 | 2.461 | 1.300 | 25.653 | 2.118 | 20.559 | 1.796 |
-| PopKV-Q | 0.381 | 4.888 | 4.172 | 2.426 | **1.291** | **25.354** | 2.114 | 20.520 | **1.796** |
-| PopKV-S | 0.366 | **4.870** | 2.927 | 2.414 | 1.291 | 25.435 | **2.110** | **20.514** | 1.796 |
-
-Gather and attention stage boundaries differ across methods, so compare `gather + attention`, not either stage alone.
-
-| Method | Score+Top-k ↓ | Gather+Attention ↓ | Sparse core total ↓ |
+| Method | PPL ↓ | Generation ms/token ↓ | token/s ↑ |
 |---|---:|---:|---:|
-| Full | 0 | 161.228 | 161.228 |
-| QUEST | **1.956** | 28.129 | **30.084** |
-| FIER | 11.165 | 26.953 | 38.117 |
-| PopKV-Q | 6.598 | **26.645** | 33.243 |
-| PopKV-S | 5.341 | 26.726 | 32.067 |
+| Full | 11.1416 | 170.742 | 5.857 |
+| QUEST | 13.8755 | 42.157 | 23.721 |
+| FIER-author | 11.1880 | 45.581 | 21.939 |
+| PopKV-Q | 11.2354 | 43.888 | 22.785 |
+| PopKV-S | 11.2626 | 43.011 | 23.250 |
 
-### Update-stage latency
+### Where token-generation time goes
 
-| Method | KV update | Retrieval update | Active staging | Metadata encode | Metadata write | Group sealing | Total update ↓ |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Full | 0.626 | 0 | 0 | 0 | 0 | 0 | **0.669** |
-| QUEST | 0.613 | **0.636** | **0.379** | **0.175** | 0.010 | 0.022 | 1.280 |
-| FIER | 0.614 | 0.640 | 0.381 | 0.180 | 0.010 | 0.019 | 1.285 |
-| PopKV-Q | 0.644 | 1.033 | 0.410 | 0.587 | **0.003** | **0.004** | 1.705 |
-| PopKV-S | **0.595** | 0.808 | 0.395 | 0.373 | 0.004 | 0.005 | 1.430 |
+Each column below is one method. **Add the component rows to obtain the total at the bottom.** All times are ms/token, averaged over the same 2,560 evaluated tokens per method.
 
-Decode GPU component closure is above 99.98% for every method. The complete 43-column result, including GPU/host residual and closure fields, is available at [`results/pg19_32k_b4096_t128_blocks10.csv`](results/pg19_32k_b4096_t128_blocks10.csv).
+| Stage (ms/token) | Full | QUEST | FIER-author | PopKV-Q | PopKV-S |
+|---|---:|---:|---:|---:|---:|
+| Score (query preparation + scoring) | 0.000 | 1.006 | 3.227 | 1.365 | 0.813 |
+| Top-k retrieval | 0.000 | 0.882 | 1.844 | 1.814 | 1.769 |
+| Attention (dense + sparse) | 124.120 | 11.221 | 11.349 | 11.285 | 11.288 |
+| Other model operations | 45.424 | 27.149 | 27.230 | 27.165 | 27.074 |
+| Decode timing remainder (GPU + host) | 0.438 | 0.488 | 0.497 | 0.482 | 0.487 |
+| Next-token selection | 0.069 | 0.060 | 0.060 | 0.060 | 0.060 |
+| K/V + retrieval metadata update | 0.691 | 1.350 | 1.373 | 1.717 | 1.519 |
+| Display rounding adjustment | 0.000 | 0.001 | 0.001 | 0.000 | 0.001 |
+| **Total token generation** | **170.742** | **42.157** | **45.581** | **43.888** | **43.011** |
 
-### Interpretation
+- **Score** includes query preparation and approximate scoring, and excludes Top-k. The historical run records these together; the current evaluator records query encoding and scoring separately, and the summarizer adds them. The historical file cannot provide a separate query-encoding measurement.
+- **Top-k retrieval** selects cached K/V positions. **Next-token selection** chooses the output token from model logits; these are separate operations.
+- **Attention** includes dense attention in the first two layers and sparse partial/merge attention elsewhere.
+- **Other model operations** include frontend, QKV/RoPE, full K/V concatenation, output projection, MLP, and final norm/LM head.
+- **Decode timing remainder** includes GPU time outside named intervals and host residual time. It is retained so the accounting matches the measured total.
+- **Display rounding adjustment** reconciles the independently rounded entries at 0.001 ms precision; it is not a measured operation. Full-precision CSV totals close within 0.000001 ms/token.
 
-- PopKV-Q matches FIER quality (`PPL 9.618`) while reducing generation-step latency by 6.47% and increasing throughput by 6.92%.
-- PopKV-S is only 3.40% slower than QUEST but has substantially better PPL (`9.780` versus `11.227`).
-- PopKV-S is 3.02x faster than Full attention at the generation-step level.
-- PopKV's main remaining optimization targets are score/top-k and metadata-update encoding.
+Prefix prefill and one-time metadata prepack are outside this decode-cycle total. Prepack measurements remain in [overall.csv](results/five_methods_split_attention_32k_b4096_t256_blocks10/overall.csv), in ms/block. Throughput is `1000 / total token-generation ms`.
 
-### Reproduction commands
+### Score-time comparison
 
-Run the shared baselines:
+FIER-author takes **3.227 ms/token** for score, compared with **1.365** for PopKV-Q and **0.813** for PopKV-S: **2.36×** and **3.97×** faster score stages (57.7% and 74.8% less time). QUEST takes **1.006 ms/token**, placing PopKV-Q above QUEST and PopKV-S below it. These are score-stage comparisons; end-to-end gains also depend on Top-k, attention, model operations, and cache updates.
 
-```bash
-python -m experiments.evaluate_pg19 \
-  --model meta-llama/Llama-3.1-8B \
-  --methods full,quest,fier \
-  --context-length 32768 \
-  --budget 4096 \
-  --generate-tokens 128 \
-  --num-blocks 10 \
-  --seed 42 \
-  --output-dir outputs/pg19_32k/baselines
-```
+PopKV-Q/S achieve approximately **3.89× / 3.97×** Full's token-generation throughput in this run. QUEST has the shortest total time; FIER-author has the lowest sparse-method PPL.
 
-Run PopKV-Q:
+[Detailed additive decode/update tables](results/five_methods_split_attention_32k_b4096_t256_blocks10/report.md) · [Full-precision timing components](results/five_methods_split_attention_32k_b4096_t256_blocks10/generation_breakdown.csv) · [Closure checks](results/five_methods_split_attention_32k_b4096_t256_blocks10/latency_closure.csv)
+
+### Reproduce or rebuild PG19 tables
 
 ```bash
 python -m experiments.evaluate_pg19 \
   --model meta-llama/Llama-3.1-8B \
-  --methods popkv \
-  --context-length 32768 \
-  --budget 4096 \
-  --group-size 128 \
-  --dim-group-size 16 \
-  --dim-kernel g16 \
-  --generate-tokens 128 \
-  --num-blocks 10 \
-  --seed 42 \
-  --output-dir outputs/pg19_32k/popkv_quality
+  --methods full,quest,fier-author,popkv-q,popkv-s \
+  --context-length 32768 --budget 4096 \
+  --generate-tokens 256 --num-blocks 10 --seed 42 \
+  --dtype bfloat16 --attention sdpa --full-layers 0,1 \
+  --output-dir outputs/pg19_32k
+
+python -m experiments.summarize_five_methods \
+  --input-dir outputs/pg19_32k --output-dir outputs/pg19_32k_tables
 ```
 
-Run PopKV-S:
+Regenerate the published tables from the included measurements without loading a model:
 
 ```bash
-python -m experiments.evaluate_pg19 \
-  --model meta-llama/Llama-3.1-8B \
-  --methods popkv \
-  --context-length 32768 \
-  --budget 4096 \
-  --group-size 64 \
-  --dim-group-size 64 \
-  --dim-kernel g64-u32 \
-  --generate-tokens 128 \
-  --num-blocks 10 \
-  --seed 42 \
-  --output-dir outputs/pg19_32k/popkv_speed
+python -m experiments.summarize_five_methods \
+  --input-dir results/five_methods_split_attention_32k_b4096_t256_blocks10/raw \
+  --output-dir outputs/rebuilt_pg19_tables
 ```
 
-The PG19 loader downloads the official test-file manifest from Hugging Face and caches the public-domain books under `data/`. Use `--text-file PATH` for a local corpus.
+The loader caches PG19 test books under `data/pg19/`. Use `--text-file PATH` for a local corpus. Re-running the current kernels produces a new measurement; the included raw files remain the evidence for the historical numbers.
 
-## LongBench evaluation
+## PG19: context-length sweep
 
-The included evaluator supports the paper's six-task pilot and resumable output:
+The [4–128K report](results/context_sweep_4k_128k_final/report.md) uses **4 blocks × 256 evaluated tokens** at budget 4,096, with 1K steps (`K = 1,024 tokens`). This is a separate experiment from the 10-block table above.
+
+| Method | Complete contexts | Available range |
+|---|---:|---|
+| Full | 37 / 125 | 4–40K |
+| QUEST | 125 / 125 | 4–128K |
+| FIER-author, PopKV-Q, PopKV-S | 122 / 125 each | 4–125K |
+
+At 32K and above, QUEST comes from a later GQA-fused run; other methods come from the earlier multi-method run. Missing measurements stay blank. No Full-relative speedup is reported where Full has no complete measurement. Block boundaries change with context length, so length-wise PPL differences also reflect changes in evaluated tokens.
+
+[Wide table](results/context_sweep_4k_128k_final/final_context_table.csv) · [All metrics and source labels](results/context_sweep_4k_128k_final/combined_long.csv) · [Reproduction instructions](results/README.md)
+
+## LongBench: five-task quality evaluation
+
+**Model:** `NousResearch/Meta-Llama-3.1-8B-Instruct` · **Context truncation setting:** 32,768 · **Budget:** 4,096 · **Precision:** BF16 · **Seed:** 42.
+
+The release evaluates all valid samples of five selected tasks: Qasper (200), MultiFieldQA-en (150), HotpotQA (200), GovReport (200), and TriviaQA (200). Each method has **950 successful samples**, for **4,750 retained predictions**. This is a five-task subset of LongBench.
+
+| Method | Qasper | MultiFieldQA-en | HotpotQA | GovReport | TriviaQA | Average ↑ |
+|---|---:|---:|---:|---:|---:|---:|
+| Full | 45.982 | 53.050 | 55.354 | 19.917 | 91.645 | 53.190 |
+| QUEST | 47.277 | 53.550 | 55.369 | 20.111 | 89.669 | 53.195 |
+| FIER-author | 46.146 | 53.630 | 56.058 | 19.972 | 91.478 | 53.457 |
+| PopKV-Q | 46.042 | 53.553 | 55.258 | 19.931 | 91.478 | 53.252 |
+| PopKV-S | 45.602 | 53.929 | 54.891 | 20.042 | 91.469 | 53.187 |
+
+Scores are percentages: token F1 for the four QA tasks and ROUGE-L for GovReport. Average is the unweighted mean of the five task scores. Full-relative retention in the detailed report is the mean of per-task score ratios, not the ratio of overall averages. Small score differences should not be interpreted as demonstrated superiority without uncertainty estimates.
+
+The retained predictions are unchanged historical measurements, reaggregated for this five-task release. Prompts are truncated before chat-template application; template tokens can make the final input slightly longer than the truncation setting.
+
+[Detailed scores and runtime](results/longbench_950_b4096/README.md) · [Experiment configuration](results/longbench_950_b4096/experiment_config.json) · [Sample manifest](results/longbench_950_b4096/sample_manifest.json) · [Raw predictions and measurements](results/longbench_950_b4096/raw_results.jsonl)
 
 ```bash
 python -m experiments.evaluate_longbench \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --methods full,quest,fier,popkv \
-  --datasets narrativeqa,qasper,multifieldqa_en,hotpotqa,gov_report,triviaqa \
-  --budgets 512,1024,2048,4096 \
-  --samples-per-dataset 12 \
-  --max-context 32768 \
-  --group-size 32 \
-  --hard-limit-minutes 240 \
-  --stop-reserve-minutes 10 \
-  --output-dir outputs/longbench_n12
+  --model NousResearch/Meta-Llama-3.1-8B-Instruct \
+  --methods full,quest,fier-author,popkv-q,popkv-s \
+  --datasets qasper,multifieldqa_en,hotpotqa,gov_report,triviaqa \
+  --budgets 4096 --all-samples --max-context 32768 \
+  --dtype bfloat16 --device-map cuda:0 --attention sdpa \
+  --full-layers 0,1 --seed 42 --validate \
+  --hard-limit-minutes 1800 --stop-reserve-minutes 15 \
+  --output-dir outputs/longbench_950
 ```
 
-Compact paper tables are retained in [`results/longbench_summary.csv`](results/longbench_summary.csv) and [`results/longbench_per_task.csv`](results/longbench_per_task.csv). The pilot is small and exhibits non-monotonic budget effects; sparse scores above Full attention should be interpreted as competitive quality within the sample, not as evidence that retrieval improves the base model.
-
-## Ablations and microbenchmarks
-
-Token-group sweep:
+Re-running the same command resumes completed samples. To rebuild only the included score/runtime tables, without loading a model:
 
 ```bash
+python -m experiments.evaluate_longbench \
+  --aggregate-only --output-dir results/longbench_950_b4096
+```
+
+## Repository layout
+
+```text
+popkv.py                    Caches, retrieval, decoder, and reference implementations
+popkv_cuda.py               CUDA extension loader and Python interface
+csrc/                       CUDA/C++ packing, update, and scoring kernels
+sparse_kernels.py           QUEST and indexed sparse attention kernels
+fier_triton.py              FIER packing and scoring
+experiments/                Evaluation, aggregation, sweeps, and cost analysis
+experiments/benchmarks/     Encoding and dimension-group microbenchmarks
+experiments/plots/          Ablation plotting utilities
+tests/                     Correctness and published-result consistency checks
+results/                   Final tables, reproducibility inputs, and provenance
+```
+
+See [results/README.md](results/README.md) for the artifact inventory and table-rebuild commands. Resource-cost results are analytical operation counts and logical tensor traffic, not measured hardware-counter DRAM traffic. K/V remains BF16 and retrieval metadata adds storage.
+
+## Validation and ablations
+
+```bash
+python -m unittest discover -s tests -v
+python -m experiments.evaluate_pg19 --dry-run
+python -m experiments.evaluate_longbench --dry-run
 python -m experiments.sweep_token_groups --dry-run
-python -m experiments.sweep_token_groups \
-  --context-length 32768 \
-  --budget 4096 \
-  --generate-tokens 500 \
-  --num-blocks 2 \
-  --tok-g-start 2 \
-  --tok-g-stop 500 \
-  --tok-g-step 2 \
-  --output-dir outputs/token_group_sweep
-```
-
-CUDA microbenchmarks:
-
-```bash
 python -m experiments.benchmarks.benchmark_encoding --dry-run
 python -m experiments.benchmarks.benchmark_dimension_groups --dry-run
 ```
 
-Plot utilities are under `experiments/plots/` and accept the generated CSV/JSON outputs through their command-line arguments.
+GPU tests require CUDA; they are skipped when CUDA is unavailable. Token-group and dimension-group analysis utilities remain available under `experiments/`; intermediate local runs are excluded from the published result set.
 
-## Scope and limitations
+## Scope
 
-- This is a research implementation for Llama-style autoregressive decode, not a drop-in replacement for every Transformers architecture.
-- Prefix prefill remains dense; the experiments target decode after a long prefix.
-- The first two transformer layers use Full attention in sparse configurations by default.
-- Selected K/V values stay in the model's original precision. PopKV compresses retrieval metadata and approximate scoring, not the final attention values.
-- PG19 PPL is sampled next-token decode PPL from fixed long-context blocks, not conventional full-corpus PPL.
-- Absolute latency depends on GPU, CUDA, PyTorch, and compilation settings. Compare methods with identical settings and hardware.
+This implementation targets Llama-style autoregressive decoding and supports per-query-head retrieval with MHA/GQA/MQA mappings. Prefix prefill remains dense. The method compresses retrieval metadata rather than the final attention values. Absolute timings depend on hardware, software, compilation, and profiling overhead; comparisons should use the same measurement setup.
 
-## Paper and authors
-
-- Paper: [PopKV](https://openreview.net/forum?id=7kA636r4L1)
-- Authors: [Minseok Choi](https://openreview.net/profile?id=~Minseok_Choi6), [Geonhee Jang](https://openreview.net/profile?id=~Geonhee_Jang1)
-
-Please use the citation metadata provided on the OpenReview paper page.
+For citation metadata, see the [paper page](https://openreview.net/forum?id=7kA636r4L1).

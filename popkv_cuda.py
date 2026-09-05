@@ -100,6 +100,44 @@ def update_fier_metadata(active_keys: torch.Tensor, packed: torch.Tensor, group_
     _extension().fier_update(active_keys, packed, group_min, group_max, int(token_offset))
 
 
+def update_fier_author_metadata(
+    active_keys: torch.Tensor,
+    packed: torch.Tensor,
+    group_zero: torch.Tensor,
+    group_scale: torch.Tensor,
+    *,
+    token_offset: int,
+) -> None:
+    """Update one active g32 word in the authors' word-major cache layout."""
+    if active_keys.ndim != 3 or not active_keys.is_cuda or not active_keys.is_contiguous():
+        raise ValueError("active_keys must be contiguous CUDA [KV heads, tokens, head dim]")
+    _extension().fier_author_update(
+        active_keys, packed, group_zero, group_scale, int(token_offset)
+    )
+
+
+def score_fier_author(
+    queries: torch.Tensor,
+    packed: torch.Tensor,
+    group_zero: torch.Tensor,
+    group_scale: torch.Tensor,
+    *,
+    head_to_kv: torch.Tensor,
+    tokens: int,
+) -> torch.Tensor:
+    """Authors-style fused 1-bit dequantization/GEMV with FP16 scores."""
+    if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
+        raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
+    return _extension().fier_author_score(
+        queries,
+        packed,
+        group_zero,
+        group_scale,
+        head_to_kv.contiguous(),
+        int(tokens),
+    )
+
+
 def allocate_query_encode_outputs(queries: torch.Tensor, *, dim_group_size: int = 32):
     """Allocate benchmark/debug outputs matching the fused scorer's query state."""
     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
@@ -117,7 +155,7 @@ def allocate_query_encode_outputs(queries: torch.Tensor, *, dim_group_size: int 
 
 
 def query_encode(queries: torch.Tensor, *, out=None, dim_group_size: int = 32):
-    """Run the benchmark-only dimension-group query encoder; production is unchanged."""
+    """Encode a PopKV query into bitplanes and dimension-group representatives."""
     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
         raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
     dim_group_size = _validate_dim_group_size(dim_group_size)
@@ -129,11 +167,31 @@ def query_encode(queries: torch.Tensor, *, out=None, dim_group_size: int = 32):
     return outputs
 
 
+def score_encoded(
+    encoded_query, packed, *, head_to_kv: torch.Tensor, tokens: int,
+    dim_group_size: int = 32, dim_kernel: str | None = None,
+) -> torch.Tensor:
+    """Score compressed keys from a pre-encoded head-dim-128 PopKV query."""
+    dim_group_size = _validate_dim_group_size(dim_group_size)
+    _validate_dim_kernel(dim_group_size, dim_kernel)
+    encoded_query = tuple(encoded_query)
+    packed = tuple(packed)
+    if len(encoded_query) != 4:
+        raise ValueError("encoded_query must contain q_sign, q_mag, q_low, q_delta")
+    if len(packed) != 4:
+        raise ValueError("packed must contain k_sign, k_mag, k_low, k_delta")
+    if any(not tensor.is_cuda or not tensor.is_contiguous() for tensor in encoded_query):
+        raise ValueError("encoded query tensors must be contiguous CUDA tensors")
+    return _extension().score_encoded(
+        *encoded_query, *packed, head_to_kv.contiguous(), int(tokens), dim_group_size,
+    )
+
+
 def score(
     queries: torch.Tensor, packed, *, head_to_kv: torch.Tensor, tokens: int,
     dim_group_size: int = 32, dim_kernel: str | None = None,
 ) -> torch.Tensor:
-    """Return Pop-KV approximate QK scores for every query head and token."""
+    """Return approximate QK scores; the head-dim-128 fast path emits FP16."""
     if queries.ndim != 3 or not queries.is_cuda or not queries.is_contiguous():
         raise ValueError("queries must be contiguous CUDA [batch, query heads, head dim]")
     dim_group_size = _validate_dim_group_size(dim_group_size)

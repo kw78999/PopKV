@@ -1,0 +1,85 @@
+{
+  "context_length": 32768,
+  "generate_tokens": 256,
+  "num_blocks": 10,
+  "budget": 4096,
+  "full_layers": 2,
+  "model": {
+    "layers": 32,
+    "hidden": 4096,
+    "intermediate": 14336,
+    "q_heads": 32,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "vocab": 128256,
+    "dtype_bytes": 2
+  },
+  "profiles": [
+    {
+      "label": "Full",
+      "method": "full",
+      "token_group": 0,
+      "dim_group": 0,
+      "page_size": 16,
+      "fier_kernel": "",
+      "score_kernel": "legacy",
+      "score_bytes": 4
+    },
+    {
+      "label": "QUEST",
+      "method": "quest",
+      "token_group": 0,
+      "dim_group": 0,
+      "page_size": 16,
+      "fier_kernel": "",
+      "score_kernel": "legacy",
+      "score_bytes": 4
+    },
+    {
+      "label": "FIER-author",
+      "method": "fier",
+      "token_group": 32,
+      "dim_group": 0,
+      "page_size": 16,
+      "fier_kernel": "author",
+      "score_kernel": "legacy",
+      "score_bytes": 2
+    },
+    {
+      "label": "PopKV-Q",
+      "method": "popkv",
+      "token_group": 128,
+      "dim_group": 16,
+      "page_size": 16,
+      "fier_kernel": "",
+      "score_kernel": "fp16-gqa-tiled",
+      "score_bytes": 2
+    },
+    {
+      "label": "PopKV-S",
+      "method": "popkv",
+      "token_group": 64,
+      "dim_group": 64,
+      "page_size": 16,
+      "fier_kernel": "",
+      "score_kernel": "fp16-gqa-tiled",
+      "score_bytes": 2
+    }
+  ],
+  "counting_contract": {
+    "fma_flops": 2,
+    "separate_operation_classes": [
+      "flops",
+      "comparisons",
+      "integer_ops",
+      "bitwise_ops",
+      "popcount",
+      "conversions",
+      "exp_ops",
+      "rsqrt_ops",
+      "topk_inputs"
+    ],
+    "logical_bytes": "operator-level tensor reads plus writes",
+    "topk_inputs": "input cardinality, not an invented comparator count"
+  }
+}

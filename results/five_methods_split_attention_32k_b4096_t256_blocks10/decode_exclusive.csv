@@ -1,0 +1,66 @@
+method,stage,ms_per_token
+Full,Frontend,0.3826065121917054
+Full,QKV + RoPE,4.674548201629659
+Full,Score (query preparation + scoring),0.0
+Full,Top-k retrieval,0.0
+Full,Full K/V concatenation,19.22093097679317
+Full,Full attention,124.11977008776739
+Full,Sparse attention partial,0.0
+Full,Sparse attention merge,0.0
+Full,Output projection,1.8520413117177668
+Full,MLP,17.78247245522216
+Full,Final norm + LM head,1.5113888630177825
+Full,GPU timing remainder,0.00929258653341094
+Full,Host decode remainder,0.42914997287880396
+QUEST,Frontend,0.3594016125658527
+QUEST,QKV + RoPE,4.560666751529789
+QUEST,Score (query preparation + scoring),1.0064968113838404
+QUEST,Top-k retrieval,0.8816120249779488
+QUEST,Full K/V concatenation,1.1640290242154152
+QUEST,Full attention,7.5506749145686625
+QUEST,Sparse attention partial,3.526159236143576
+QUEST,Sparse attention merge,0.14376048832928062
+QUEST,Output projection,1.8555358248762786
+QUEST,MLP,17.700526861613618
+QUEST,Final norm + LM head,1.5092050373088568
+QUEST,GPU timing remainder,0.009321292607637588
+QUEST,Host decode remainder,0.47910298218776004
+FIER-author,Frontend,0.3606754123000428
+FIER-author,QKV + RoPE,4.579601252014982
+FIER-author,Score (query preparation + scoring),3.22702527543006
+FIER-author,Top-k retrieval,1.843799726072757
+FIER-author,Full K/V concatenation,1.1718628257047385
+FIER-author,Full attention,7.588258373364806
+FIER-author,Sparse attention partial,3.617614987262641
+FIER-author,Sparse attention merge,0.14342878835159353
+FIER-author,Output projection,1.872724536698661
+FIER-author,MLP,17.735481477249415
+FIER-author,Final norm + LM head,1.5095169499050827
+FIER-author,GPU timing remainder,0.009445776640495751
+FIER-author,Host decode remainder,0.4876353591142106
+PopKV-Q,Frontend,0.3545703502604738
+PopKV-Q,QKV + RoPE,4.552141788782319
+PopKV-Q,Score (query preparation + scoring),1.364753487096459
+PopKV-Q,Top-k retrieval,1.814361411902064
+PopKV-Q,Full K/V concatenation,1.1624135495163501
+PopKV-Q,Full attention,7.541658491175622
+PopKV-Q,Sparse attention partial,3.5995403248205546
+PopKV-Q,Sparse attention merge,0.1433998883352615
+PopKV-Q,Output projection,1.8692142244733987
+PopKV-Q,MLP,17.71706592089031
+PopKV-Q,Final norm + LM head,1.5098524997476488
+PopKV-Q,GPU timing remainder,0.009285396635823418
+PopKV-Q,Host decode remainder,0.4731618072015408
+PopKV-S,Frontend,0.35577452458674086
+PopKV-S,QKV + RoPE,4.533302651892882
+PopKV-S,Score (query preparation + scoring),0.8134847250563325
+PopKV-S,Top-k retrieval,1.7691459117646446
+PopKV-S,Full K/V concatenation,1.162176199676469
+PopKV-S,Full attention,7.545116862654686
+PopKV-S,Sparse attention partial,3.602010512611014
+PopKV-S,Sparse attention merge,0.14110397580152495
+PopKV-S,Output projection,1.850673749911948
+PopKV-S,MLP,17.66350820728112
+PopKV-S,Final norm + LM head,1.5088388879317791
+PopKV-S,GPU timing remainder,0.009251446685084375
+PopKV-S,Host decode remainder,0.4780385806428967

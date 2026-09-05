@@ -55,13 +55,14 @@ class SparseKernelTests(unittest.TestCase):
 
         torch.manual_seed(101)
         for dim in (64, 128):
-            queries = torch.randn(8, dim, device="cuda", dtype=torch.bfloat16)
-            mins = torch.randn(2, 23, dim, device="cuda", dtype=torch.float32)
-            maxs = mins + torch.rand_like(mins)
-            mapping = torch.arange(8, device="cuda") // 4
-            expected = quest_score_reference(queries, mins, maxs, mapping, pages=17)
-            actual = quest_scores(queries, mins, maxs, mapping, pages=17)
-            torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-6)
+            for kv_heads in (1, 2, 8):
+                queries = torch.randn(8, dim, device="cuda", dtype=torch.bfloat16)
+                mins = torch.randn(kv_heads, 23, dim, device="cuda", dtype=torch.float32)
+                maxs = mins + torch.rand_like(mins)
+                mapping = torch.arange(8, device="cuda") // (8 // kv_heads)
+                expected = quest_score_reference(queries, mins, maxs, mapping, pages=17)
+                actual = quest_scores(queries, mins, maxs, mapping, pages=17)
+                torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-6)
 
     def test_quest_selection_matches_reference_at_page_boundaries(self) -> None:
         from sparse_kernels import quest_indices
@@ -110,6 +111,31 @@ class SparseKernelTests(unittest.TestCase):
         )
         actual = indexed_attention(
             queries, keys, values, current_keys, current_values, indices, mapping, valid,
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+    def test_split_indexed_attention_matches_materialized_reference(self) -> None:
+        from sparse_kernels import indexed_attention_split
+
+        torch.manual_seed(104)
+        q_heads, kv_heads, tokens, dim = 8, 2, 32768, 128
+        queries = torch.randn(q_heads, dim, device="cuda", dtype=torch.bfloat16)
+        keys = torch.randn(kv_heads, tokens, dim, device="cuda", dtype=torch.bfloat16)
+        values = torch.randn_like(keys)
+        current_keys = torch.randn(kv_heads, dim, device="cuda", dtype=torch.bfloat16)
+        current_values = torch.randn_like(current_keys)
+        mapping = torch.arange(q_heads, device="cuda") // 4
+        indices = torch.randint(tokens, (q_heads, 4096), device="cuda")
+        indices[:, -1] = tokens
+        valid = torch.ones_like(indices, dtype=torch.bool)
+        valid[:, -7:-1] = False
+        expected = materialized_attention(
+            queries, keys, values, current_keys, current_values, indices, mapping, valid,
+        )
+        actual = indexed_attention_split(
+            queries, keys, values, current_keys, current_values, indices, mapping, valid,
+            split_tokens=256,
         )
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 

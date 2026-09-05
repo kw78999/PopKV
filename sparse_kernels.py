@@ -14,7 +14,6 @@ def _quest_score_kernel(
     queries,
     page_min,
     page_max,
-    head_to_kv,
     scores,
     pages,
     q_heads: tl.constexpr,
@@ -23,16 +22,21 @@ def _quest_score_kernel(
     min_stride_p,
     max_stride_h,
     max_stride_p,
+    Q_PER_KV: tl.constexpr,
     BLOCK_P: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     page_block = tl.program_id(0)
-    qh = tl.program_id(1)
-    kvh = tl.load(head_to_kv + qh)
+    kvh = tl.program_id(1)
+    q_local = tl.arange(0, Q_PER_KV)
+    qh = kvh * Q_PER_KV + q_local
     page = page_block * BLOCK_P + tl.arange(0, BLOCK_P)
     dim = tl.arange(0, BLOCK_D)
     mask = (page[:, None] < pages) & (dim[None, :] < head_dim)
-    query = tl.load(queries + qh * head_dim + dim, mask=dim < head_dim, other=0.0).to(tl.float32)
+    query = tl.load(
+        queries + qh[:, None] * head_dim + dim[None, :],
+        mask=(qh[:, None] < q_heads) & (dim[None, :] < head_dim), other=0.0,
+    ).to(tl.float32)
     lo = tl.load(
         page_min + kvh * min_stride_h + page[:, None] * min_stride_p + dim[None, :],
         mask=mask,
@@ -43,9 +47,19 @@ def _quest_score_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    bound = tl.maximum(query[None, :] * lo, query[None, :] * hi)
-    result = tl.sum(bound, axis=1)
-    tl.store(scores + qh * pages + page, result, mask=page < pages)
+    # A CTA owns one KV head and reuses each min/max page tile for all GQA
+    # query heads mapped to it. Keeping Q_PER_KV * BLOCK_P approximately 16
+    # preserves the old arithmetic tile size while eliminating repeated
+    # metadata reads across GQA heads.
+    bound = tl.maximum(
+        query[:, None, :] * lo[None, :, :],
+        query[:, None, :] * hi[None, :, :],
+    )
+    result = tl.sum(bound, axis=2)
+    tl.store(
+        scores + qh[:, None] * pages + page[None, :], result,
+        mask=(qh[:, None] < q_heads) & (page[None, :] < pages),
+    )
 
 
 def quest_scores(
@@ -65,17 +79,25 @@ def quest_scores(
     q_heads, head_dim = (int(x) for x in queries.shape)
     if pages <= 0 or pages > int(page_min.shape[1]) or int(page_min.shape[2]) != head_dim:
         raise ValueError("invalid Quest page count or head dimension")
-    mapping = head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous()
+    kv_heads = int(page_min.shape[0])
+    if q_heads % kv_heads:
+        raise ValueError("Quest GQA fusion requires query heads divisible by KV heads")
+    q_per_kv = q_heads // kv_heads
+    if int(head_to_kv.numel()) != q_heads:
+        raise ValueError("Quest head mapping size mismatch")
     scores = torch.empty((q_heads, pages), device=queries.device, dtype=torch.float32)
     block_d = triton.next_power_of_2(head_dim)
-    block_p = 16
+    # Match the previous 16-page-by-one-query arithmetic tile. For
+    # Llama-3.1-8B (four Q heads per KV head), this becomes four pages by four
+    # queries and loads every page-bound tile only once.
+    block_p = max(1, 16 // q_per_kv)
     with torch.cuda.device(queries.device):
-        _quest_score_kernel[(triton.cdiv(pages, block_p), q_heads)](
-            queries.contiguous(), page_min, page_max, mapping, scores, pages,
+        _quest_score_kernel[(triton.cdiv(pages, block_p), kv_heads)](
+            queries.contiguous(), page_min, page_max, scores, pages,
             q_heads=q_heads, head_dim=head_dim,
             min_stride_h=page_min.stride(0), min_stride_p=page_min.stride(1),
             max_stride_h=page_max.stride(0), max_stride_p=page_max.stride(1),
-            BLOCK_P=block_p, BLOCK_D=block_d, num_warps=4,
+            Q_PER_KV=q_per_kv, BLOCK_P=block_p, BLOCK_D=block_d, num_warps=4,
         )
     return scores
 
@@ -209,6 +231,174 @@ def indexed_attention(
             num_warps=4,
         )
     return output
+
+
+
+@triton.jit
+def _indexed_attention_split_kernel(
+    queries, prefix_keys, prefix_values, current_keys, current_values,
+    indices, valid_mask, head_to_kv, partials, prefix_tokens,
+    selected_tokens, num_splits, stride_kh, stride_kt, stride_vh, stride_vt,
+    q_heads: tl.constexpr, head_dim: tl.constexpr, scale: tl.constexpr,
+    HAS_VALID: tl.constexpr, SPLIT_T: tl.constexpr, BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr, STATE_D: tl.constexpr,
+):
+    qh = tl.program_id(0)
+    split = tl.program_id(1)
+    kvh = tl.load(head_to_kv + qh)
+    dim = tl.arange(0, BLOCK_D)
+    dim_mask = dim < head_dim
+    query = tl.load(queries + qh * head_dim + dim, mask=dim_mask, other=0.0).to(tl.float32)
+    current_key = tl.load(current_keys + kvh * head_dim + dim, mask=dim_mask, other=0.0).to(tl.float32)
+    current_value = tl.load(current_values + kvh * head_dim + dim, mask=dim_mask, other=0.0).to(tl.float32)
+    running_max = -float("inf")
+    running_sum = 0.0
+    accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    split_start = split * SPLIT_T
+
+    for local_start in range(0, SPLIT_T, BLOCK_T):
+        offset = split_start + local_start + tl.arange(0, BLOCK_T)
+        token_mask = offset < selected_tokens
+        token = tl.load(indices + qh * selected_tokens + offset, mask=token_mask, other=0)
+        if HAS_VALID:
+            token_mask = token_mask & tl.load(
+                valid_mask + qh * selected_tokens + offset, mask=token_mask, other=0
+            ).to(tl.int1)
+        is_current = token == prefix_tokens
+        safe_token = tl.minimum(token, prefix_tokens - 1)
+        tile_mask = token_mask[:, None] & dim_mask[None, :]
+        cached_key = tl.load(
+            prefix_keys + kvh * stride_kh + safe_token[:, None] * stride_kt + dim[None, :],
+            mask=tile_mask, other=0.0,
+        ).to(tl.float32)
+        key = tl.where(is_current[:, None], current_key[None, :], cached_key)
+        logits = tl.sum(key * query[None, :], axis=1) * scale
+        logits = tl.where(token_mask, logits, -float("inf"))
+        block_max = tl.max(logits, axis=0)
+        new_max = tl.maximum(running_max, block_max)
+        old_scale = tl.exp(running_max - new_max)
+        probabilities = tl.exp(logits - new_max)
+        probabilities = tl.where(token_mask, probabilities, 0.0)
+        cached_value = tl.load(
+            prefix_values + kvh * stride_vh + safe_token[:, None] * stride_vt + dim[None, :],
+            mask=tile_mask, other=0.0,
+        ).to(tl.float32)
+        value = tl.where(is_current[:, None], current_value[None, :], cached_value)
+        accumulator = accumulator * old_scale + tl.sum(probabilities[:, None] * value, axis=0)
+        running_sum = running_sum * old_scale + tl.sum(probabilities, axis=0)
+        running_max = new_max
+
+    state = (qh * num_splits + split) * STATE_D
+    tl.store(partials + state, running_max)
+    tl.store(partials + state + 1, running_sum)
+    tl.store(partials + state + 2 + dim, accumulator, mask=dim_mask)
+
+
+@triton.jit
+def _indexed_attention_merge_kernel(
+    partials, output, num_splits, head_dim: tl.constexpr,
+    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr, STATE_D: tl.constexpr,
+):
+    qh = tl.program_id(0)
+    split = tl.arange(0, BLOCK_S)
+    split_mask = split < num_splits
+    base = (qh * num_splits + split) * STATE_D
+    partial_max = tl.load(partials + base, mask=split_mask, other=-float("inf"))
+    partial_sum = tl.load(partials + base + 1, mask=split_mask, other=0.0)
+    global_max = tl.max(partial_max, axis=0)
+    weight = tl.exp(partial_max - global_max)
+    denominator = tl.sum(partial_sum * weight, axis=0)
+    dim = tl.arange(0, BLOCK_D)
+    dim_mask = dim < head_dim
+    accumulator = tl.load(
+        partials + base[:, None] + 2 + dim[None, :],
+        mask=split_mask[:, None] & dim_mask[None, :], other=0.0,
+    )
+    numerator = tl.sum(accumulator * weight[:, None], axis=0)
+    tl.store(output + qh * head_dim + dim, numerator / denominator, mask=dim_mask)
+
+
+def indexed_attention_split_partial(
+    queries: torch.Tensor, prefix_keys: torch.Tensor, prefix_values: torch.Tensor,
+    current_keys: torch.Tensor, current_values: torch.Tensor, indices: torch.Tensor,
+    head_to_kv: torch.Tensor, valid_mask: torch.Tensor | None = None, *,
+    split_tokens: int = 256,
+) -> torch.Tensor:
+    """Launch token-tiled online-softmax partial attention states."""
+    if queries.ndim != 2 or prefix_keys.ndim != 3 or prefix_values.shape != prefix_keys.shape:
+        raise ValueError("invalid indexed-attention tensor ranks or K/V shapes")
+    if indices.ndim != 2 or int(indices.shape[0]) != int(queries.shape[0]):
+        raise ValueError("indices must be [query heads, selected tokens]")
+    if valid_mask is not None and valid_mask.shape != indices.shape:
+        raise ValueError("valid mask must match indices")
+    if split_tokens <= 0 or split_tokens % 16:
+        raise ValueError("split_tokens must be a positive multiple of 16")
+    if not queries.is_cuda or any(x.device != queries.device for x in (
+        prefix_keys, prefix_values, current_keys, current_values, indices, head_to_kv
+    )):
+        raise RuntimeError("indexed-attention tensors must share a CUDA device")
+    q_heads, head_dim = (int(x) for x in queries.shape)
+    prefix_tokens = int(prefix_keys.shape[1])
+    selected_tokens = int(indices.shape[1])
+    if prefix_tokens <= 0 or selected_tokens <= 0:
+        raise ValueError("indexed attention requires non-empty prefix and selection")
+    num_splits = triton.cdiv(selected_tokens, split_tokens)
+    state_d = head_dim + 2
+    partials = torch.empty(
+        (q_heads, num_splits, state_d), device=queries.device, dtype=torch.float32,
+    )
+    dummy_valid = indices if valid_mask is None else valid_mask.contiguous()
+    mapping = head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous()
+    block_d = triton.next_power_of_2(head_dim)
+    with torch.cuda.device(queries.device):
+        _indexed_attention_split_kernel[(q_heads, num_splits)](
+            queries.contiguous(), prefix_keys, prefix_values,
+            current_keys.contiguous(), current_values.contiguous(), indices.contiguous(),
+            dummy_valid, mapping, partials, prefix_tokens, selected_tokens, num_splits,
+            stride_kh=prefix_keys.stride(0), stride_kt=prefix_keys.stride(1),
+            stride_vh=prefix_values.stride(0), stride_vt=prefix_values.stride(1),
+            q_heads=q_heads, head_dim=head_dim, scale=1.0 / math.sqrt(head_dim),
+            HAS_VALID=valid_mask is not None, SPLIT_T=split_tokens, BLOCK_T=16,
+            BLOCK_D=block_d, STATE_D=state_d, num_warps=4,
+        )
+    return partials
+
+
+def indexed_attention_split_merge(
+    partials: torch.Tensor, output_like: torch.Tensor,
+) -> torch.Tensor:
+    """Merge split online-softmax states into one output per query head."""
+    if partials.ndim != 3 or partials.dtype != torch.float32 or not partials.is_cuda:
+        raise ValueError("partials must be CUDA float32 [query heads, splits, D+2]")
+    if output_like.ndim != 2 or output_like.device != partials.device:
+        raise ValueError("output_like must be [query heads, head dim] on the partial device")
+    q_heads, num_splits, state_d = (int(x) for x in partials.shape)
+    head_dim = int(output_like.shape[1])
+    if int(output_like.shape[0]) != q_heads or state_d != head_dim + 2:
+        raise ValueError("partial/output shape mismatch")
+    output = torch.empty_like(output_like)
+    block_d = triton.next_power_of_2(head_dim)
+    with torch.cuda.device(output.device):
+        _indexed_attention_merge_kernel[(q_heads,)](
+            partials, output, num_splits, head_dim=head_dim,
+            BLOCK_S=triton.next_power_of_2(num_splits), BLOCK_D=block_d,
+            STATE_D=state_d, num_warps=4,
+        )
+    return output
+
+
+def indexed_attention_split(
+    queries: torch.Tensor, prefix_keys: torch.Tensor, prefix_values: torch.Tensor,
+    current_keys: torch.Tensor, current_values: torch.Tensor, indices: torch.Tensor,
+    head_to_kv: torch.Tensor, valid_mask: torch.Tensor | None = None, *,
+    split_tokens: int = 256,
+) -> torch.Tensor:
+    """Split-token fused indexed attention with online-softmax merging."""
+    partials = indexed_attention_split_partial(
+        queries, prefix_keys, prefix_values, current_keys, current_values,
+        indices, head_to_kv, valid_mask, split_tokens=split_tokens,
+    )
+    return indexed_attention_split_merge(partials, queries)
 
 
 # ---- Quest exact page selection ---------------------------------------------

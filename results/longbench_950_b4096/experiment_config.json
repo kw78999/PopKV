@@ -1,0 +1,82 @@
+{
+  "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+  "methods": "full,quest,fier-author,popkv-q,popkv-s",
+  "datasets": "qasper,multifieldqa_en,hotpotqa,gov_report,triviaqa",
+  "budgets": "4096",
+  "samples_per_dataset": 40,
+  "all_samples": true,
+  "max_context": 32768,
+  "group_size": 32,
+  "dim_group_size": 32,
+  "dim_kernel": "auto",
+  "quest_page_size": 16,
+  "fier_kernel": "author",
+  "full_layers": "0,1",
+  "seed": 42,
+  "dtype": "bfloat16",
+  "device_map": "cuda:0",
+  "attention": "sdpa",
+  "trust_remote_code": false,
+  "output_dir": "results/longbench_950_b4096",
+  "cache_dir": "data/longbench_v1",
+  "hard_limit_minutes": 1800.0,
+  "stop_reserve_minutes": 15.0,
+  "max_gen_scale": 1.0,
+  "validate": true,
+  "resume": true,
+  "dry_run": false,
+  "resolved_methods": [
+    {
+      "method": "full",
+      "label": "full",
+      "budget": null
+    },
+    {
+      "method": "quest",
+      "label": "quest_p16_b4096",
+      "budget": 4096
+    },
+    {
+      "method": "fier-author",
+      "label": "fier-author_b4096",
+      "budget": 4096
+    },
+    {
+      "method": "popkv-q",
+      "label": "popkv-q_b4096",
+      "budget": 4096
+    },
+    {
+      "method": "popkv-s",
+      "label": "popkv-s_b4096",
+      "budget": 4096
+    }
+  ],
+  "resolved_datasets": [
+    "qasper",
+    "multifieldqa_en",
+    "hotpotqa",
+    "gov_report",
+    "triviaqa"
+  ],
+  "gqa_policy": "per query-head Top-k; query heads sharing a KV head may select different token positions; exact FP K/V read directly by indexed attention using head_to_kv",
+  "fier": "sequence-grouped g32 1-bit RTN, token Top-k, current token reserves one slot",
+  "popkv": "Q/K sign and magnitude encoding with max/2 and min/2 thresholds; representative-weighted fused CUDA scoring; per-query-head Top-k; current token reserves one slot",
+  "popkv_presets": {
+    "popkv-normal": {
+      "token_group_size": 32,
+      "dim_group_size": 32
+    },
+    "popkv-q": {
+      "token_group_size": 128,
+      "dim_group_size": 16
+    },
+    "popkv-s": {
+      "token_group_size": 64,
+      "dim_group_size": 64
+    }
+  },
+  "sink_recent_forced": false,
+  "resolved_model_commit": "d10aef7999a2b5ba950ab3974312feeedbfe0b77",
+  "resolved_tokenizer_commit": null
+}

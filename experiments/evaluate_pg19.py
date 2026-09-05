@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import math
 import time
 import urllib.request
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,11 @@ from popkv import LlamaSparseDecoder, METHODS, RetrievalConfig, load_hf_model
 
 
 LATENCY_KEYS = (
-    "decode_ms", "frontend_ms", "qkv_rope_ms", "retrieval_stage_ms", "score_ms", "topk_ms",
-    "gather_ms", "attention_ms", "output_projection_ms", "mlp_ms",
+    "decode_ms", "frontend_ms", "qkv_rope_ms",
+    "retrieval_query_encode_ms", "retrieval_score_ms", "retrieval_search_ms",
+    "score_ms", "topk_ms",
+    "full_gather_ms", "full_attention_ms", "sparse_attention_partial_ms",
+    "sparse_attention_merge_ms", "output_projection_ms", "mlp_ms",
     "final_norm_lm_head_ms", "gpu_decode_ms", "gpu_component_sum_ms",
     "gpu_unattributed_ms", "host_decode_residual_ms", "accounted_decode_ms",
     "decode_closure_error_ms", "kv_update_ms", "retrieval_update_ms",
@@ -47,10 +51,13 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--dim-kernel", choices=("auto", "g16", "g32", "g64-u32", "g64-u64"),
                    default="auto", help="specialized PopKV dimension-score kernel")
     p.add_argument("--quest-page-size", type=int, default=16)
+    p.add_argument("--fier-kernel", choices=("author",), default="author")
     p.add_argument("--full-layers", default="0,1")
     p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     p.add_argument("--device-map", default="auto")
     p.add_argument("--attention", choices=("sdpa", "eager", "flash_attention_2"), default="sdpa")
+    p.add_argument("--prefill-chunk-size", type=int, default=0,
+                   help="use a zero-copy static KV cache and prefill the prefix in chunks; 0 disables")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--pg19-cache-dir", default="data/pg19")
@@ -133,7 +140,7 @@ def main() -> None:
     config = RetrievalConfig(
         budget=args.budget, group_size=args.group_size, dim_group_size=args.dim_group_size,
         dim_kernel=args.dim_kernel,
-        quest_page_size=args.quest_page_size,
+        quest_page_size=args.quest_page_size, fier_kernel=args.fier_kernel,
         full_layers=tuple(int(x) for x in args.full_layers.split(",") if x.strip()),
     ); config.validate()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -147,11 +154,21 @@ def main() -> None:
         attention=args.attention, trust_remote_code=args.trust_remote_code,
     )
     decoder = LlamaSparseDecoder(model, config); blocks = load_blocks(tokenizer, args); rows = []
+    run_started = time.perf_counter()
+    completed_jobs = 0
+    total_jobs = len(blocks) * len(methods)
     for block_idx, block in enumerate(blocks):
         prefix_ids = block[:args.context_length - 1]
         current_ids = block[args.context_length - 1:args.context_length - 1 + args.generate_tokens]
         targets = block[args.context_length:args.context_length + args.generate_tokens]
-        prefix = decoder.build_prefix_cache(prefix_ids); sync(decoder.device)
+        print(
+            f"[prefill] block={block_idx + 1}/{len(blocks)} context={args.context_length} "
+            f"chunk={args.prefill_chunk_size or args.context_length}", flush=True,
+        )
+        prefix = decoder.build_prefix_cache(
+            prefix_ids, reserve_tokens=args.generate_tokens + 1,
+            chunk_size=args.prefill_chunk_size,
+        ); sync(decoder.device)
         for method in methods:
             pack_started = time.perf_counter()
             retrieval = None if method == "full" else decoder.build_retrieval_caches(
@@ -207,10 +224,15 @@ def main() -> None:
                     "block": block_idx, "step": step, "method": method,
                     "nll": float(F.cross_entropy(logits[None], target.to(decoder.device)[None]).item()),
                     "prepack_ms": prepack_ms, "decode_ms": decode_ms,
-                    "search_ms": diag.candidate_search_ms, "retrieval_stage_ms": diag.retrieval_stage_ms,
+                    "retrieval_query_encode_ms": diag.retrieval_query_encode_ms,
+                    "retrieval_score_ms": diag.retrieval_score_ms,
+                    "retrieval_search_ms": diag.retrieval_search_ms,
                     "score_ms": diag.candidate_score_ms,
-                    "topk_ms": diag.candidate_topk_ms, "gather_ms": diag.selected_gather_ms,
-                    "attention_ms": diag.selected_attention_ms,
+                    "topk_ms": diag.candidate_topk_ms,
+                    "full_gather_ms": diag.full_gather_ms,
+                    "full_attention_ms": diag.full_attention_ms,
+                    "sparse_attention_partial_ms": diag.sparse_attention_partial_ms,
+                    "sparse_attention_merge_ms": diag.sparse_attention_merge_ms,
                     "frontend_ms": diag.frontend_ms, "qkv_rope_ms": diag.qkv_rope_ms,
                     "output_projection_ms": diag.output_projection_ms, "mlp_ms": diag.mlp_ms,
                     "final_norm_lm_head_ms": diag.final_norm_lm_head_ms,
@@ -237,7 +259,24 @@ def main() -> None:
             write_results(output, rows, metadata)
             done = [x for x in rows if x["block"] == block_idx and x["method"] == method]
             nll = sum(x["nll"] for x in done) / len(done)
-            print(f"block={block_idx} method={method} ppl={math.exp(nll):.4f} decode_ms={sum(x['decode_ms'] for x in done)/len(done):.1f}", flush=True)
+            completed_jobs += 1
+            elapsed = time.perf_counter() - run_started
+            remaining = elapsed / completed_jobs * (total_jobs - completed_jobs)
+            eta = datetime.now(timezone.utc) + timedelta(seconds=remaining)
+            print(
+                f"[progress] {completed_jobs}/{total_jobs} ({100 * completed_jobs / total_jobs:.1f}%) "
+                f"block={block_idx + 1}/{len(blocks)} method={method} "
+                f"ppl={math.exp(nll):.4f} "
+                f"decode_ms={sum(x['decode_ms'] for x in done) / len(done):.1f} "
+                f"elapsed_h={elapsed / 3600:.2f} eta_utc={eta:%Y-%m-%dT%H:%M:%SZ}",
+                flush=True,
+            )
+            del kv, retrieval
+            gc.collect()
+            if decoder.device.type == "cuda": torch.cuda.empty_cache()
+        del prefix, prefix_ids, current_ids, targets
+        gc.collect()
+        if decoder.device.type == "cuda": torch.cuda.empty_cache()
     print(f"results={output}")
 
 

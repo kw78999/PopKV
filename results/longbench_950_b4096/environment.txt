@@ -1,0 +1,8 @@
+python=3.11.10 (main, Sep  7 2024, 18:35:41) [GCC 11.4.0]
+platform=Linux-6.8.0-134-generic-x86_64-with-glibc2.35
+torch=2.4.1+cu124
+transformers=4.57.6
+$ git rev-parse HEAD
+79ab85de19489b3f83b5ec4fa62e29cec656d1d9
+$ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+NVIDIA RTX A6000, 580.159.03, 49140 MiB

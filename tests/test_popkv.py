@@ -31,12 +31,15 @@ class PopKVTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             diagnostics.candidate_search_ms,
-            diagnostics.retrieval_stage_ms + diagnostics.candidate_score_ms +
+            diagnostics.retrieval_query_encode_ms + diagnostics.retrieval_score_ms +
             diagnostics.candidate_topk_ms, places=7,
         )
 
-    def test_public_methods_are_only_paper_methods(self) -> None:
-        self.assertEqual(METHODS, ("full", "quest", "fier", "popkv"))
+    def test_public_methods_include_normal_ablation(self) -> None:
+        self.assertEqual(
+            METHODS,
+            ("full", "quest", "fier-author", "popkv-normal", "popkv-q", "popkv-s"),
+        )
 
     def test_sparse_methods_skip_configured_full_layers(self) -> None:
         self.assertEqual(_sparse_layer_indices(4, (0, 1)), (2, 3))
@@ -48,6 +51,7 @@ class PopKVTests(unittest.TestCase):
 
     def test_release_configuration_is_explicit(self) -> None:
         RetrievalConfig().validate()
+        RetrievalConfig(fier_kernel="author").validate()
         for size in (8, 16, 32, 64, 128):
             RetrievalConfig(group_size=size).validate()
         RetrievalConfig(group_size=5).validate()
@@ -113,6 +117,36 @@ class PopKVTests(unittest.TestCase):
             torch.testing.assert_close(cached, direct, atol=0, rtol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_fier_author_matches_its_affine_1bit_reference_and_active_update(self) -> None:
+        from fier_triton import pack_keys, score_packed_batched, score_tensors
+
+        torch.manual_seed(711)
+        keys = torch.randn(2, 31, 128, device="cuda", dtype=torch.float16)
+        query = torch.randn(1, 8, 128, device="cuda", dtype=torch.float16)
+        mapping = torch.arange(8, device="cuda") // 4
+        packed, zero, scale = pack_keys(
+            keys.contiguous(), group_size=32, implementation="author",
+        )
+        actual = score_packed_batched(
+            query, packed, zero, scale, mapping, tokens=31, group_size=32,
+            implementation="author",
+        )
+        shifts = torch.arange(32, device="cuda", dtype=torch.int64)
+        bits = ((packed.to(torch.int64).unsqueeze(2) >> shifts[None, None, :, None]) & 1)
+        dequant = zero[:, :, None].float() + bits.float() * scale[:, :, None].float()
+        dequant = dequant.reshape(2, -1, 128)[:, :31]
+        expected = torch.einsum("bhd,htd->bht", query.float(), dequant.index_select(0, mapping)).half()
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-3)
+
+        cache = build_fier_cache(keys, group_size=32, reserve_tokens=4, implementation="author")
+        current = torch.randn(2, 1, 128, device="cuda", dtype=torch.float16)
+        append_fier(cache, current); keys = torch.cat([keys, current], dim=1)
+        cached = score_packed_batched(query, cache.packed, cache.group_min, cache.group_max,
+            mapping, tokens=32, group_size=32, implementation="author")
+        direct = score_tensors(query, keys, head_to_kv=mapping, group_size=32, implementation="author")
+        torch.testing.assert_close(cached, direct, atol=0, rtol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_popkv_cuda_matches_readable_reference(self) -> None:
         from popkv_cuda import pack_keys, score
         torch.manual_seed(11)
@@ -121,7 +155,8 @@ class PopKVTests(unittest.TestCase):
         mapping = torch.arange(8, device="cuda") // 4
         expected = popkv_reference_scores(queries, keys, head_to_kv=mapping)
         actual = score(queries.contiguous(), pack_keys(keys.contiguous()), head_to_kv=mapping, tokens=37)
-        torch.testing.assert_close(actual, expected, atol=0.12, rtol=0.02)
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual.float(), expected, atol=0.12, rtol=0.02)
 
     def test_reference_query_encode_shapes_dtypes_and_invariants(self) -> None:
         cases = (
@@ -239,7 +274,7 @@ class PopKVTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_key_encoding_and_scores_for_all_dimension_groups(self) -> None:
-        from popkv_cuda import pack_keys, score
+        from popkv_cuda import pack_keys, query_encode, score, score_encoded
         torch.manual_seed(31)
         mapping = torch.arange(8, device="cuda") // 4
         for group in (16, 32, 64):
@@ -253,8 +288,33 @@ class PopKVTests(unittest.TestCase):
                 torch.testing.assert_close(packed[2].float(), expected_packed[2], atol=2e-3, rtol=2e-3)
                 torch.testing.assert_close(packed[3].float(), expected_packed[3], atol=2e-3, rtol=2e-3)
                 actual = score(query.contiguous(), packed, head_to_kv=mapping, tokens=37, dim_group_size=group)
+                if dim == 128:
+                    encoded = query_encode(query.contiguous(), dim_group_size=group)
+                    separated = score_encoded(
+                        encoded, packed, head_to_kv=mapping, tokens=37,
+                        dim_group_size=group,
+                    )
+                    torch.testing.assert_close(separated, actual, atol=0, rtol=0)
                 expected = popkv_reference_scores(query, keys, head_to_kv=mapping, dim_group_size=group)
-                torch.testing.assert_close(actual, expected, atol=0.15, rtol=0.025)
+                self.assertEqual(actual.dtype, torch.float16 if dim == 128 else torch.float32)
+                torch.testing.assert_close(actual.float(), expected, atol=0.15, rtol=0.025)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_gqa_tiled_score_supports_multiple_batches(self) -> None:
+        from popkv_cuda import pack_keys, score
+        torch.manual_seed(32)
+        keys = torch.randn(2, 257, 128, device="cuda", dtype=torch.bfloat16)
+        query = torch.randn(2, 8, 128, device="cuda", dtype=torch.bfloat16)
+        mapping = torch.arange(8, device="cuda") // 4
+        for group, kernel in ((16, "g16"), (64, "g64-u32")):
+            packed = pack_keys(keys.contiguous(), dim_group_size=group)
+            actual = score(query.contiguous(), packed, head_to_kv=mapping, tokens=257,
+                           dim_group_size=group, dim_kernel=kernel)
+            expected = popkv_reference_scores(
+                query, keys, head_to_kv=mapping, dim_group_size=group,
+            )
+            self.assertEqual(actual.dtype, torch.float16)
+            torch.testing.assert_close(actual.float(), expected, atol=0.15, rtol=0.025)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_g64_uint32_and_uint64_score_kernels_match(self) -> None:
@@ -289,7 +349,7 @@ class PopKVTests(unittest.TestCase):
             expected_scores = popkv_reference_scores(
                 query, keys, head_to_kv=mapping, group_size=token_group_size,
             )
-            torch.testing.assert_close(actual, expected_scores, atol=0.15, rtol=0.025)
+            torch.testing.assert_close(actual.float(), expected_scores, atol=0.15, rtol=0.025)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_popkv_incremental_cache_crosses_every_token_group_boundary(self) -> None:

@@ -72,67 +72,12 @@ def _pack_kernel(
         mask=token < tokens,
         other=0.0,
     ).to(tl.float32)
-    bit = (value >= (lo + hi) * 0.5) & (token < tokens)
+    midpoint = (lo + hi) * 0.5
+    bit = (value > midpoint) & (token < tokens)
     # Accumulate in int64 so lane 31 does not overflow during the reduction;
     # storing to int32 preserves the desired bit pattern.
     word_value = tl.sum(bit.to(tl.int64) << lane, axis=0)
     tl.store(packed + (kvh * head_dim + d) * words + word, word_value)
-
-
-@triton.jit
-def _score_kernel(
-    queries,
-    packed,
-    mins,
-    maxs,
-    head_to_kv,
-    scores,
-    tokens,
-    q_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    num_groups,
-    words,
-    group_size: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-):
-    token_block = tl.program_id(0)
-    row = tl.program_id(1)
-    qh = row % q_heads
-    kvh = tl.load(head_to_kv + qh)
-    token = token_block * BLOCK_T + tl.arange(0, BLOCK_T)
-    dims = tl.arange(0, BLOCK_D)
-    token_mask = token < tokens
-    dim_mask = dims < head_dim
-
-    query = tl.load(
-        queries + row * head_dim + dims,
-        mask=dim_mask,
-        other=0.0,
-    ).to(tl.float32)
-    words_value = tl.load(
-        packed + (kvh * head_dim + dims[None, :]) * words + token[:, None] // 32,
-        mask=token_mask[:, None] & dim_mask[None, :],
-        other=0,
-    )
-    bit = (words_value >> (token[:, None] % 32)) & 1
-    group = token // group_size
-    metadata_offset = (
-        (kvh * num_groups + group[:, None]) * head_dim + dims[None, :]
-    )
-    lo = tl.load(
-        mins + metadata_offset,
-        mask=token_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    hi = tl.load(
-        maxs + metadata_offset,
-        mask=token_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    dequantized = tl.where(bit != 0, hi, lo)
-    result = tl.sum(dequantized * query[None, :], axis=1)
-    tl.store(scores + row * tokens + token, result, mask=token_mask)
 
 
 def _validate_keys(keys: torch.Tensor, group_size: int) -> None:
@@ -149,12 +94,16 @@ def _validate_keys(keys: torch.Tensor, group_size: int) -> None:
 
 
 def pack_keys(
-    keys: torch.Tensor, *, group_size: int
+    keys: torch.Tensor, *, group_size: int, implementation: str = "author"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack [KVH, T, D] keys and return (bits, group_min, group_max)."""
+    """Pack authors-style FIER keys as [KVH, token_word, D]."""
 
     keys = keys.contiguous()
     _validate_keys(keys, int(group_size))
+    if implementation != "author":
+        raise ValueError("only the FIER authors implementation is public")
+    if implementation == "author" and group_size != 32:
+        raise ValueError("authors-style FIER requires group_size=32")
     kv_heads, tokens, head_dim = (int(v) for v in keys.shape)
     num_groups = math.ceil(tokens / group_size)
     words = math.ceil(tokens / 32)
@@ -191,70 +140,49 @@ def pack_keys(
             group_size=group_size,
             num_warps=1,
         )
+    packed = packed.transpose(1, 2).contiguous()
+    maxs.sub_(mins)  # Author notation: zero=min, scale=max-min.
     return packed, mins, maxs
 
 
 def score_packed_batched(
     queries: torch.Tensor,
     packed: torch.Tensor,
-    mins: torch.Tensor,
-    maxs: torch.Tensor,
+    zero: torch.Tensor,
+    scale: torch.Tensor,
     head_to_kv: torch.Tensor,
     *,
     tokens: int,
     group_size: int,
+    implementation: str = "author",
 ) -> torch.Tensor:
-    """Fused dequantization/GEMV for queries [B, QH, D]."""
-
+    """Authors-style fused 1-bit dequantization/GEMV for [B,QH,D]."""
+    if implementation != "author":
+        raise ValueError("only the FIER authors implementation is public")
+    if group_size != 32:
+        raise ValueError("FIER-author requires group_size=32")
     if queries.ndim != 3 or packed.ndim != 3:
         raise ValueError("queries and packed keys must be rank 3")
     if not queries.is_cuda or queries.device != packed.device:
-        raise RuntimeError("all FIER Triton tensors must share a CUDA device")
-    batch, q_heads, head_dim = (int(v) for v in queries.shape)
-    if int(packed.shape[1]) != head_dim:
-        raise ValueError("query/key head_dim mismatch")
-    if mins.shape != maxs.shape or mins.ndim != 3:
-        raise ValueError("group min/max tensors must have matching rank-3 shapes")
-    if int(mins.shape[0]) != int(packed.shape[0]):
-        raise ValueError("packed key and metadata KV-head counts differ")
-    if tokens <= 0 or tokens > int(packed.shape[2]) * 32:
-        raise ValueError("tokens is inconsistent with packed key storage")
+        raise RuntimeError("all FIER tensors must share a CUDA device")
+    _, q_heads, head_dim = (int(v) for v in queries.shape)
+    if int(packed.shape[2]) != head_dim:
+        raise ValueError("authors-style packed key must be [KVH, words, head_dim]")
+    if zero.shape != scale.shape or zero.ndim != 3:
+        raise ValueError("authors-style zero/scale tensors must have matching shapes")
     expected_groups = math.ceil(tokens / group_size)
-    if int(mins.shape[1]) < expected_groups or int(mins.shape[2]) != head_dim:
-        raise ValueError("metadata capacity is inconsistent with tokens/group_size")
-    storage_groups = int(mins.shape[1])
-    storage_words = int(packed.shape[2])
-    if head_to_kv.numel() != q_heads:
-        raise ValueError("head_to_kv must contain one entry per query head")
-
-    queries = queries.contiguous()
-    head_to_kv = head_to_kv.to(
-        device=queries.device, dtype=torch.int64
-    ).contiguous()
-    scores = torch.empty(
-        (batch, q_heads, tokens), device=queries.device, dtype=torch.float32
+    if tokens <= 0 or tokens > int(packed.shape[1]) * 32:
+        raise ValueError("tokens is inconsistent with authors-style packed storage")
+    if int(zero.shape[0]) != int(packed.shape[0]) or int(zero.shape[1]) < expected_groups:
+        raise ValueError("authors-style metadata capacity is inconsistent with tokens")
+    if int(zero.shape[2]) != head_dim or head_to_kv.numel() != q_heads:
+        raise ValueError("authors-style head dimensions or mapping are inconsistent")
+    from popkv_cuda import score_fier_author
+    return score_fier_author(
+        queries.contiguous(), packed, zero, scale,
+        head_to_kv=head_to_kv.to(device=queries.device, dtype=torch.int64).contiguous(),
+        tokens=tokens,
     )
-    block_d = triton.next_power_of_2(head_dim)
-    block_t = 32
-    with torch.cuda.device(queries.device):
-        _score_kernel[(triton.cdiv(tokens, block_t), batch * q_heads)](
-            queries,
-            packed,
-            mins,
-            maxs,
-            head_to_kv,
-            scores,
-            tokens=tokens,
-            q_heads=q_heads,
-            head_dim=head_dim,
-            num_groups=storage_groups,
-            words=storage_words,
-            group_size=group_size,
-            BLOCK_D=block_d,
-            BLOCK_T=block_t,
-            num_warps=4,
-        )
-    return scores
 
 
 def score_tensors(
@@ -263,8 +191,9 @@ def score_tensors(
     *,
     head_to_kv: torch.Tensor,
     group_size: int,
+    implementation: str = "author",
 ) -> torch.Tensor:
-    packed, mins, maxs = pack_keys(keys, group_size=group_size)
+    packed, mins, maxs = pack_keys(keys, group_size=group_size, implementation=implementation)
     return score_packed_batched(
         queries,
         packed,
@@ -273,4 +202,5 @@ def score_tensors(
         head_to_kv,
         tokens=int(keys.shape[1]),
         group_size=group_size,
+        implementation=implementation,
     )

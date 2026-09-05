@@ -1,0 +1,43 @@
+{
+  "model": "meta-llama/Llama-3.1-8B",
+  "methods": [
+    "full",
+    "quest",
+    "fier-author",
+    "popkv-q",
+    "popkv-s"
+  ],
+  "context_length": 32768,
+  "generate_tokens": 256,
+  "num_blocks": 10,
+  "budget": 4096,
+  "group_size": 32,
+  "dim_group_size": 32,
+  "dim_kernel": "auto",
+  "quest_page_size": 16,
+  "fier_kernel": "author",
+  "full_layers": "0,1",
+  "dtype": "bfloat16",
+  "device_map": "auto",
+  "attention": "sdpa",
+  "seed": 42,
+  "output_dir": "outputs/pg19_32k_b4096_t256_blocks10/five_methods_split_attention",
+  "pg19_cache_dir": "data/pg19",
+  "pg19_max_books": 64,
+  "text_file": null,
+  "trust_remote_code": false,
+  "dry_run": false,
+  "created_at_utc": "20260820T075626Z",
+  "retrieval": {
+    "budget": 4096,
+    "group_size": 32,
+    "dim_group_size": 32,
+    "dim_kernel": "auto",
+    "quest_page_size": 16,
+    "fier_kernel": "author",
+    "full_layers": [
+      0,
+      1
+    ]
+  }
+}

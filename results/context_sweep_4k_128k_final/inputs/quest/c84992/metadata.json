@@ -1,0 +1,40 @@
+{
+  "model": "meta-llama/Llama-3.1-8B",
+  "methods": [
+    "quest"
+  ],
+  "context_length": 84992,
+  "generate_tokens": 256,
+  "num_blocks": 4,
+  "budget": 4096,
+  "group_size": 32,
+  "dim_group_size": 32,
+  "dim_kernel": "auto",
+  "quest_page_size": 16,
+  "fier_kernel": "author",
+  "full_layers": "0,1",
+  "dtype": "bfloat16",
+  "device_map": "auto",
+  "attention": "sdpa",
+  "prefill_chunk_size": 8192,
+  "seed": 42,
+  "output_dir": "outputs/context_sweep_quest_gqa_fused_c32k_128k_step1k_b4096_blocks4_t256/c84992",
+  "pg19_cache_dir": "data/pg19",
+  "pg19_max_books": 64,
+  "text_file": null,
+  "trust_remote_code": false,
+  "dry_run": false,
+  "created_at_utc": "20260824T170705Z",
+  "retrieval": {
+    "budget": 4096,
+    "group_size": 32,
+    "dim_group_size": 32,
+    "dim_kernel": "auto",
+    "quest_page_size": 16,
+    "fier_kernel": "author",
+    "full_layers": [
+      0,
+      1
+    ]
+  }
+}
