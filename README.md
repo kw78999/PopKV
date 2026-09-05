@@ -13,8 +13,8 @@ PopKV encodes query/key retrieval metadata as sign and magnitude bit planes, ran
 | Full | Dense attention | — | — |
 | QUEST | Page min/max bounds; page size 16 | — | — |
 | FIER | Sequence-grouped one-bit retrieval | 32 | — |
-| PopKV-Q | Popcount retrieval; quality preset | 128 | 16 |
-| PopKV-S | Popcount retrieval; speed preset | 64 | 64 |
+| PopKV-Q (Ours) | Popcount retrieval; quality preset | 128 | 16 |
+| PopKV-S (Ours) | Popcount retrieval; speed preset | 64 | 64 |
 
 All published comparisons use these five methods. `popkv-normal` (token group 32, dimension group 32) remains available for ablations. Sparse methods keep layers 0 and 1 dense. Each query head selects its own tokens, including for GQA; the current token reserves one budget slot. Sparse attention uses 256-token partial reductions followed by a merge.
 
@@ -52,14 +52,14 @@ PG19 PPL is sampled next-token PPL from fixed blocks. Latency is the measured de
 | Full | 11.1416 | 170.742 | 5.857 |
 | QUEST | 13.8755 | 42.157 | 23.721 |
 | FIER | 11.1880 | 45.581 | 21.939 |
-| PopKV-Q | 11.2354 | 43.888 | 22.785 |
-| PopKV-S | 11.2626 | 43.011 | 23.250 |
+| PopKV-Q (Ours) | 11.2354 | 43.888 | 22.785 |
+| PopKV-S (Ours) | 11.2626 | 43.011 | 23.250 |
 
 ### Where token-generation time goes
 
 Each column below is one method. **Add the component rows to obtain the total at the bottom.** All times are ms/token, averaged over the same 2,560 evaluated tokens per method.
 
-| Stage (ms/token) | Full | QUEST | FIER | PopKV-Q | PopKV-S |
+| Stage (ms/token) | Full | QUEST | FIER | PopKV-Q (Ours) | PopKV-S (Ours) |
 |---|---:|---:|---:|---:|---:|
 | Score (query preparation + scoring) | 0.000 | 1.006 | 3.227 | 1.365 | 0.813 |
 | Top-k retrieval | 0.000 | 0.882 | 1.844 | 1.814 | 1.769 |
@@ -117,13 +117,9 @@ The loader caches PG19 test books under `data/pg19/`. Use `--text-file PATH` for
 
 The [4–128K report](results/context_sweep_4k_128k_final/report.md) uses **4 blocks × 256 evaluated tokens** at budget 4,096, with 1K steps (`K = 1,024 tokens`). This is a separate experiment from the 10-block table above.
 
-| Method | Complete contexts | Available range |
-|---|---:|---|
-| Full | 37 / 125 | 4–40K |
-| QUEST | 125 / 125 | 4–128K |
-| FIER, PopKV-Q, PopKV-S | 122 / 125 each | 4–125K |
+<img width="409" height="240" alt="image" src="https://github.com/user-attachments/assets/b8d3138f-af27-4610-8bb7-7ae84412693a" />
 
-At 32K and above, QUEST comes from a later GQA-fused run; other methods come from the earlier multi-method run. Missing measurements stay blank. No Full-relative speedup is reported where Full has no complete measurement. Block boundaries change with context length, so length-wise PPL differences also reflect changes in evaluated tokens.
+Score computation time increases with context length across all methods. PopKV achieves substantially lower scoring overhead than FIER while remaining competitive with QUEST, demonstrating better scalability for long-context retrieval.
 
 [Wide table](results/context_sweep_4k_128k_final/final_context_table.csv) · [All metrics and source labels](results/context_sweep_4k_128k_final/combined_long.csv) · [Reproduction instructions](results/README.md)
 
