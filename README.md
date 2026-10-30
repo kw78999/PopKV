@@ -10,6 +10,8 @@ PopKV encodes query/key retrieval metadata as sign and magnitude bit planes, ran
 
 <img width="815" height="604" alt="image" src="https://github.com/user-attachments/assets/e691ad81-3c47-4859-bb80-e8e34eced96e" />
 
+<img width="794" height="448" alt="image" src="https://github.com/user-attachments/assets/6abcb04b-cfcc-4f26-8c23-20b0479a44c3" />
+
 
 | Method | Retrieval | Token group | Dimension group |
 |---|---|---:|---:|
