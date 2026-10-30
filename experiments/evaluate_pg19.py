@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from popkv import LlamaSparseDecoder, METHODS, RetrievalConfig, load_hf_model
+from decode_runtime import method_order
 
 
 LATENCY_KEYS = (
@@ -64,6 +65,9 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--pg19-max-books", type=int, default=64)
     p.add_argument("--text-file", default=None)
     p.add_argument("--trust-remote-code", action="store_true")
+    p.add_argument("--mlp-backend", choices=("eager", "cuda-graph"), default="eager")
+    p.add_argument("--warmup-decodes", type=int, default=5)
+    p.add_argument("--method-order", choices=("balanced", "fixed"), default="balanced")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -145,15 +149,17 @@ def main() -> None:
     ); config.validate()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = Path(args.output_dir or f"outputs/pg19_{stamp}")
-    metadata = vars(args) | {"methods": methods, "created_at_utc": stamp, "retrieval": asdict(config)}
+    metadata = vars(args) | {"methods": methods, "created_at_utc": stamp, "retrieval": asdict(config), "decode_timer_version": "pooled-events-v2", "mlp_scope": "post-attention norm + MLP + residual; graph includes input copy"}
     if args.dry_run:
         print(json.dumps(metadata, indent=2)); return
+    if (output / "metadata.json").exists(): raise FileExistsError("use a fresh output-dir for the new timing protocol")
+    if args.warmup_decodes < 1: raise ValueError("warmup-decodes must be positive")
     torch.manual_seed(args.seed)
     model, tokenizer = load_hf_model(
         args.model, dtype=args.dtype, device_map=args.device_map,
         attention=args.attention, trust_remote_code=args.trust_remote_code,
     )
-    decoder = LlamaSparseDecoder(model, config); blocks = load_blocks(tokenizer, args); rows = []
+    decoder = LlamaSparseDecoder(model, config, mlp_backend=args.mlp_backend); blocks = load_blocks(tokenizer, args); rows = []
     run_started = time.perf_counter()
     completed_jobs = 0
     total_jobs = len(blocks) * len(methods)
@@ -169,14 +175,16 @@ def main() -> None:
             prefix_ids, reserve_tokens=args.generate_tokens + 1,
             chunk_size=args.prefill_chunk_size,
         ); sync(decoder.device)
-        for method in methods:
+        for method in (method_order(methods, block_idx) if args.method_order == "balanced" else methods):
             pack_started = time.perf_counter()
             retrieval = None if method == "full" else decoder.build_retrieval_caches(
                 prefix, method=method, reserve_tokens=args.generate_tokens + 1,
             )
             sync(decoder.device); prepack_ms = (time.perf_counter() - pack_started) * 1000
             kv = decoder.build_static_kv_cache(prefix, reserve_tokens=args.generate_tokens + 1)
-            decoder.decode(kv, current_ids[0], method=method, retrieval_caches=retrieval); sync(decoder.device)
+            for _ in range(args.warmup_decodes):
+                decoder.decode(kv, current_ids[0], method=method, retrieval_caches=retrieval)
+            sync(decoder.device)
             for step, (current, target) in enumerate(zip(current_ids, targets)):
                 sync(decoder.device); started = time.perf_counter()
                 logits, diag, new_k, new_v = decoder.decode(

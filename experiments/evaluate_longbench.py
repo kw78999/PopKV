@@ -113,6 +113,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-gen-scale", type=float, default=1.0, help="Smoke-only generation-length multiplier")
     p.add_argument("--validate", action="store_true")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mlp-backend", choices=("eager", "cuda-graph"), default="eager")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--aggregate-only", action="store_true", help="rebuild tables from saved results without loading a model")
     return p.parse_args()
@@ -661,10 +662,17 @@ def main() -> None:
         "popkv_presets": {name: {"token_group_size": values[0], "dim_group_size": values[1]}
                           for name, values in POPKV_PRESETS.items()},
         "sink_recent_forced": False,
+        "decode_timer_version": "pooled-events-v2",
     }
     if args.dry_run:
         print(json.dumps(config, indent=2, ensure_ascii=False))
         return
+    old_config_path = output_dir / "experiment_config.json"
+    if old_config_path.exists() and (output_dir / "raw_results.jsonl").exists():
+        previous = json.loads(old_config_path.read_text())
+        for key in ("mlp_backend", "decode_timer_version"):
+            if previous.get(key) != config[key]:
+                raise SystemExit(f"{key} changed; use a fresh output-dir to keep timing protocols separate")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "predictions").mkdir(exist_ok=True)
     (output_dir / "experiment_config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
@@ -692,7 +700,7 @@ def main() -> None:
         json.dumps(config, indent=2, ensure_ascii=False) + chr(10)
     )
     base_retrieval = retrieval_for(args, specs[0])
-    decoder = LlamaSparseDecoder(model, base_retrieval)
+    decoder = LlamaSparseDecoder(model, base_retrieval, mlp_backend=args.mlp_backend)
     samples = load_samples(tokenizer, args, datasets)
     manifest = [{k: v for k, v in asdict(s).items() if k != "input_ids"} for s in samples]
     (output_dir / "sample_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
