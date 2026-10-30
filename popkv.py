@@ -13,6 +13,8 @@ from typing import Any, Sequence
 import torch
 import torch.nn.functional as F
 
+from decode_runtime import DecodeEventPool, CUDAGraphMLP, mlp_block
+
 METHODS = ("full", "quest", "fier", "popkv-normal", "popkv-q", "popkv-s")
 
 POPKV_PRESETS = {
@@ -160,25 +162,28 @@ _DECODE_STAGE_FIELDS = {
 class _DecodeStageTimer:
     """Measure mutually exclusive decode stages without intermediate synchronization."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, event_pool: DecodeEventPool | None = None) -> None:
         self.device = device
         self.cuda = device.type == "cuda"
         self.segments: list[tuple[str, Any, Any]] = []
+        self.event_pool = event_pool
         if self.cuda:
-            self.total_start = torch.cuda.Event(enable_timing=True)
-            self.last = torch.cuda.Event(enable_timing=True)
-            self.total_start.record(); self.last.record()
+            if self.event_pool is None:
+                self.event_pool = DecodeEventPool(device, len(_DECODE_STAGE_FIELDS) + 2)
+            self.event_pool.reset()
+            self.total_start = self.last = self.event_pool.record()
         else:
             self.total_start = self.last = time.perf_counter()
 
     def mark(self, name: str) -> None:
-        end = torch.cuda.Event(enable_timing=True) if self.cuda else time.perf_counter()
-        if self.cuda: end.record()
+        if name not in _DECODE_STAGE_FIELDS:
+            raise ValueError(f"unknown decode stage: {name}")
+        end = self.event_pool.record() if self.cuda else time.perf_counter()
         self.segments.append((name, self.last, end)); self.last = end
 
     def finish(self, diagnostics: DecodeDiagnostics) -> None:
         if self.cuda:
-            torch.cuda.synchronize(self.device)
+            self.last.synchronize()
             elapsed = lambda start, end: float(start.elapsed_time(end))
         else:
             elapsed = lambda start, end: (end - start) * 1000.0
@@ -758,9 +763,14 @@ def _layer_cache(cache: Any, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
 class LlamaSparseDecoder:
     """One-token Llama decoder exposing FullAttention, Quest, FIER, and Pop-KV."""
 
-    def __init__(self, model: Any, retrieval: RetrievalConfig = RetrievalConfig()) -> None:
+    def __init__(self, model: Any, retrieval: RetrievalConfig = RetrievalConfig(), *,
+                 mlp_backend: str = "eager") -> None:
         retrieval.validate()
         self.model = model
+        self.experimental_activation_callback = None
+        self.experimental_scorer = None
+        self.experimental_topk = None
+        self.experimental_full_sdpa = False
         self.backbone = getattr(model, "model", None)
         if self.backbone is None:
             raise TypeError("expected a LlamaForCausalLM-compatible model")
@@ -771,6 +781,40 @@ class LlamaSparseDecoder:
         self.kv_group_size = self.num_heads // self.num_kv_heads
         self.head_dim = int(getattr(model.config, "head_dim", model.config.hidden_size // self.num_heads))
         self.head_to_kv = torch.arange(self.num_heads, device=self.device, dtype=torch.long) // self.kv_group_size
+        self._decode_event_pool = None
+        self._mlp_graphs: list[CUDAGraphMLP] = []
+        self.set_mlp_backend(mlp_backend)
+
+    @torch.inference_mode()
+    def set_mlp_backend(self, backend: str) -> None:
+        if backend not in ("eager", "cuda-graph"):
+            raise ValueError("mlp_backend must be eager or cuda-graph")
+        graphs = []
+        if backend == "cuda-graph":
+            if self.device.type != "cuda":
+                raise ValueError("CUDA Graph MLP requires a CUDA device")
+            weight = self.backbone.embed_tokens.weight
+            example = torch.ones((1, 1, self.model.config.hidden_size), device=self.device, dtype=weight.dtype)
+            for layer in self.layers:
+                if any(p.device != self.device or p.dtype != weight.dtype for p in layer.parameters()):
+                    raise ValueError("CUDA Graph MLP requires uniform device and dtype across layers")
+                graphs.append(CUDAGraphMLP(layer, example))
+        self._mlp_graphs = graphs
+        self.mlp_backend = backend
+
+    def _run_mlp(self, layer_idx: int, hidden: torch.Tensor) -> torch.Tensor:
+        if self.mlp_backend == "cuda-graph":
+            return self._mlp_graphs[layer_idx](hidden)
+        return mlp_block(self.layers[layer_idx], hidden)
+
+    def _new_decode_timer(self) -> _DecodeStageTimer:
+        if self.device.type == "cuda" and self._decode_event_pool is None:
+            # Reserve the worst-case stage count identically for every method.
+            self._decode_event_pool = DecodeEventPool(
+                self.device, len(self.layers) * len(_DECODE_STAGE_FIELDS) + 4,
+            )
+        return _DecodeStageTimer(self.device, self._decode_event_pool)
+
 
     @property
     def device(self) -> torch.device:
@@ -949,7 +993,7 @@ class LlamaSparseDecoder:
             raise ValueError(f"method must be one of {METHODS}")
         if method != "full" and retrieval_caches is None:
             raise ValueError(f"{method} requires build_retrieval_caches()")
-        timer = _DecodeStageTimer(self.device)
+        timer = self._new_decode_timer()
         prefix_length = cache.length
         token = torch.as_tensor(token_id, device=self.device, dtype=torch.long).view(1, 1)
         hidden = self.backbone.embed_tokens(token)
@@ -974,11 +1018,20 @@ class LlamaSparseDecoder:
                 new_keys.append(k.detach()); new_values.append(v.detach())
             timer.mark("qkv_rope")
 
+            if self.experimental_activation_callback is not None:
+                self.experimental_activation_callback(q[0, :, 0], prefix_k, prefix_v, k, v, layer_idx)
             force_full = method == "full" or layer_idx in self.retrieval.full_layers
             if force_full:
                 def gather_full(): return torch.cat([prefix_k, k], 2), torch.cat([prefix_v, v], 2)
                 all_k, all_v = gather_full(); timer.mark("full_gather")
                 def attend_full():
+                    if self.experimental_full_sdpa:
+                        from torch.nn.attention import sdpa_kernel, SDPBackend
+                        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                            return F.scaled_dot_product_attention(
+                                q, all_k, all_v, dropout_p=0.0, is_causal=False,
+                                enable_gqa=True,
+                            ).reshape(self.num_heads, self.head_dim)
                     grouped = q[0].view(self.num_kv_heads, self.kv_group_size, 1, self.head_dim)
                     return F.scaled_dot_product_attention(
                         grouped, all_k[0, :, None], all_v[0, :, None], dropout_p=0.0, is_causal=False,
@@ -1027,13 +1080,17 @@ class LlamaSparseDecoder:
                         q[0, :, 0].unsqueeze(0).contiguous(),
                         dim_group_size=sparse_cache.dim_group_size,
                     ); timer.mark("retrieval_query_encode")
-                    scores = score_encoded(
+                    scorer = self.experimental_scorer or score_encoded
+                    scores = scorer(
                         encoded_query, sparse_cache.packed,
                         head_to_kv=self.head_to_kv, tokens=sparse_cache.token_count,
                         dim_group_size=sparse_cache.dim_group_size,
                         dim_kernel={16: "g16", 32: "g32", 64: "g64-u32"}[sparse_cache.dim_group_size],
                     ); timer.mark("retrieval_score")
                     def topk_popkv():
+                        if self.experimental_topk is not None:
+                            selected = self.experimental_topk(scores, min(self.retrieval.budget - 1, prefix_length))[0]
+                            return _append_current(selected, num_tokens)
                         selected = torch.topk(
                             scores, k=min(self.retrieval.budget - 1, prefix_length),
                             dim=-1, sorted=False,
@@ -1060,8 +1117,7 @@ class LlamaSparseDecoder:
             output = output.reshape(1, 1, -1).to(normalized.dtype)
             hidden = residual + attention.o_proj(output)
             timer.mark("output_projection")
-            residual = hidden
-            hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+            hidden = self._run_mlp(layer_idx, hidden)
             timer.mark("mlp")
 
         hidden = self.backbone.norm(hidden)

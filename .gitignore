@@ -21,3 +21,6 @@ htmlcov/
 .vscode/
 .DS_Store
 *.pid
+
+# Local environments for MLP fairness checks.
+.venv-mlp-*/
