@@ -8,6 +8,9 @@ PopKV encodes query/key retrieval metadata as sign and magnitude bit planes, ran
 
 ## Methods
 
+<img width="815" height="604" alt="image" src="https://github.com/user-attachments/assets/e691ad81-3c47-4859-bb80-e8e34eced96e" />
+
+
 | Method | Retrieval | Token group | Dimension group |
 |---|---|---:|---:|
 | Full | Dense attention | — | — |
@@ -64,12 +67,12 @@ Each column below is one method. **Add the component rows to obtain the total at
 | Score (query preparation + scoring) | 0.000 | 1.006 | 3.227 | 1.365 | 0.813 |
 | Top-k retrieval | 0.000 | 0.882 | 1.844 | 1.814 | 1.769 |
 | Attention (dense + sparse) | 124.120 | 11.221 | 11.349 | 11.285 | 11.288 |
-| Other model operations | 45.424 | 27.149 | 27.230 | 27.165 | 27.074 |
+| Other model operations | 27.281 | 27.149 | 27.230 | 27.165 | 27.074 |
 | Decode timing remainder (GPU + host) | 0.438 | 0.488 | 0.497 | 0.482 | 0.487 |
 | Next-token selection | 0.069 | 0.060 | 0.060 | 0.060 | 0.060 |
 | K/V + retrieval metadata update | 0.691 | 1.350 | 1.373 | 1.717 | 1.519 |
 | Display rounding adjustment | 0.000 | 0.001 | 0.001 | 0.000 | 0.001 |
-| **Total token generation** | **170.742** | **42.157** | **45.581** | **43.888** | **43.011** |
+| **Total token generation** | **152.599** | **42.157** | **45.581** | **43.888** | **43.011** |
 
 - **Score** includes query preparation and approximate scoring, and excludes Top-k. The historical run records these together; the current evaluator records query encoding and scoring separately, and the summarizer adds them. The historical file cannot provide a separate query-encoding measurement.
 - **Top-k retrieval** selects cached K/V positions. **Next-token selection** chooses the output token from model logits; these are separate operations.
